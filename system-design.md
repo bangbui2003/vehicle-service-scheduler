@@ -274,7 +274,66 @@ Not implemented in this assessment but the recommended approach for production:
 
 ---
 
-## 6. GenAI Collaboration in the Design Phase
+## 6. Production Readiness Decisions
+
+This section documents deliberate design choices made to ensure the system is ready for real production load — not just the acceptance criteria. Each decision addresses a specific failure mode that only appears at scale or in edge cases.
+
+### Pagination on `GET /appointments`
+
+**Problem without it:** A dealership with three years of history has hundreds of thousands of appointment records. A single `findMany` with no limit would load all of them into memory, serialize the entire result set to JSON, and either crash the server or time out the client.
+
+**Decision:** All list endpoints return a paginated envelope `{ data, total, page, limit }` with a default of 20 records per page and a hard cap of 100.
+
+```json
+{ "data": [...], "total": 4821, "page": 2, "limit": 20 }
+```
+
+The `total` field allows the client to calculate page count without a second request. The hard cap prevents a client passing `limit=999999` and bypassing the guard.
+
+### Database Indexes on the `appointments` Table
+
+**Problem without them:** The availability query inside every booking transaction runs a subquery against `appointments` filtered by `service_bay_id`, `technician_id`, `start_time`, and `end_time`. Without indexes, PostgreSQL performs a full sequential scan of the table on every booking request. At 1 million rows this scan takes hundreds of milliseconds and locks the table longer — directly increasing contention under load.
+
+**Decision:** Four indexes placed on the exact column combinations used by the availability subqueries:
+
+```prisma
+@@index([serviceBayId, startTime, endTime])   // availability check for bays
+@@index([technicianId, startTime, endTime])   // availability check for technicians
+@@index([dealershipId, startTime])            // list by dealership+date (common dashboard query)
+@@index([customerId])                         // list appointments by customer
+```
+
+These are partial in intent — they mirror the WHERE clauses in `AvailabilityService` exactly, so PostgreSQL can use index-only scans rather than heap fetches.
+
+### Past-Date Validation
+
+**Problem without it:** A client can submit `desiredStartTime: "2020-01-01T09:00:00Z"`. The system would find a free bay (nothing is booked 5 years ago), create an appointment, and commit it. The record is immediately in a logically invalid state — the appointment is "CONFIRMED" for a time that has already passed.
+
+**Decision:** `create()` rejects any `desiredStartTime` that is not strictly in the future before the transaction opens. This is a business rule, not a format rule — validated in the service layer, not the DTO, because it depends on runtime state (`new Date()`).
+
+```typescript
+if (startTime <= new Date()) {
+  throw new BadRequestException('Appointment start time must be in the future');
+}
+```
+
+### Concurrency: `SELECT FOR UPDATE SKIP LOCKED`
+
+**Problem without it:** Two HTTP requests arriving within milliseconds for the same bay and time slot both read "bay is free", both pass the availability check, and both insert an appointment for the same bay — double booking.
+
+**Decision:** Both availability queries run inside a single `$transaction` with `FOR UPDATE SKIP LOCKED` on the resource rows. The first transaction to acquire the lock proceeds; the second skips the locked row and either claims a different resource or returns 409 immediately — no waiting, no deadlock.
+
+This is the only pattern that solves the double-booking problem at the database level without introducing an external dependency (Redis, distributed mutex) or a retry loop (optimistic locking).
+
+### Type-Safe Query Filters
+
+**Problem without it:** `const where: any = {}` compiles successfully even if a field name is misspelled or a Prisma schema field is renamed during refactoring. The bug only surfaces at runtime.
+
+**Decision:** `Prisma.AppointmentWhereInput` is used instead of `any`. TypeScript catches mismatched field names at compile time, meaning a schema rename triggers a compiler error on every query that references the old field name.
+
+---
+
+## 7. GenAI Collaboration in the Design Phase
 
 ### Principle: Design First, Delegate Second
 
