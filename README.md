@@ -43,10 +43,10 @@ cp .env.example .env
 docker-compose up db -d
 ```
 
-### 4. Run database migrations
+### 4. Push database schema
 
 ```bash
-yarn db:migrate
+yarn db:push
 ```
 
 ### 5. Seed test data (optional)
@@ -77,8 +77,11 @@ docker-compose up --build
 ## Running Tests
 
 ```bash
-# Unit tests
+# Unit tests (no database required)
 yarn test
+
+# End-to-end tests (no database required — services are mocked)
+yarn test:e2e
 
 # With coverage
 yarn test:cov
