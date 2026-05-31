@@ -1,11 +1,13 @@
 import {
   Body,
   Controller,
+  DefaultValuePipe,
   Delete,
   Get,
   HttpCode,
   HttpStatus,
   Param,
+  ParseIntPipe,
   Post,
   Query,
 } from '@nestjs/common';
@@ -28,16 +30,20 @@ export class AppointmentsController {
   }
 
   @Get()
-  @ApiOperation({ summary: 'List appointments with optional filters' })
+  @ApiOperation({ summary: 'List appointments with optional filters and pagination' })
   @ApiQuery({ name: 'customerId', required: false })
   @ApiQuery({ name: 'dealershipId', required: false })
   @ApiQuery({ name: 'date', required: false, example: '2026-06-01' })
+  @ApiQuery({ name: 'page', required: false, example: 1 })
+  @ApiQuery({ name: 'limit', required: false, example: 20, description: 'Max 100' })
   findAll(
     @Query('customerId') customerId?: string,
     @Query('dealershipId') dealershipId?: string,
     @Query('date') date?: string,
+    @Query('page', new DefaultValuePipe(1), ParseIntPipe) page?: number,
+    @Query('limit', new DefaultValuePipe(20), ParseIntPipe) limit?: number,
   ) {
-    return this.appointmentsService.findAll({ customerId, dealershipId, date });
+    return this.appointmentsService.findAll({ customerId, dealershipId, date, page, limit });
   }
 
   @Get(':id')

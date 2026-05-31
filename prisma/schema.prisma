@@ -93,6 +93,10 @@ model Appointment {
   createdAt    DateTime          @default(now())
   updatedAt    DateTime          @updatedAt
 
+  @@index([dealershipId, startTime])
+  @@index([serviceBayId, startTime, endTime])
+  @@index([technicianId, startTime, endTime])
+  @@index([customerId])
   @@map("appointments")
 }
 

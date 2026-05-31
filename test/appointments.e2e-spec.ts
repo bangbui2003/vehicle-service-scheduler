@@ -12,6 +12,7 @@ const buildMockPrisma = () => ({
   appointment: {
     findUnique: jest.fn(),
     findMany: jest.fn(),
+    count: jest.fn().mockResolvedValue(0),
     update: jest.fn(),
   },
 });
@@ -171,17 +172,19 @@ describe('AppointmentsController (e2e)', () => {
   // ─── GET /appointments ──────────────────────────────────────────────────────
 
   describe('GET /appointments', () => {
-    it('returns 200 with an empty array when there are no appointments', () => {
+    it('returns 200 with paginated envelope when there are no appointments', () => {
       mockPrisma.appointment.findMany.mockResolvedValue([]);
+      mockPrisma.appointment.count.mockResolvedValue(0);
 
       return request(app.getHttpServer())
         .get('/appointments')
         .expect(200)
-        .expect([]);
+        .expect({ data: [], total: 0, page: 1, limit: 20 });
     });
 
     it('returns 200 and filters by dealershipId query param', async () => {
       mockPrisma.appointment.findMany.mockResolvedValue([mockAppointment]);
+      mockPrisma.appointment.count.mockResolvedValue(1);
 
       const res = await request(app.getHttpServer())
         .get('/appointments?dealershipId=deal-uuid-1')
@@ -192,7 +195,21 @@ describe('AppointmentsController (e2e)', () => {
           where: expect.objectContaining({ dealershipId: 'deal-uuid-1' }),
         }),
       );
-      expect(res.body).toHaveLength(1);
+      expect(res.body.data).toHaveLength(1);
+      expect(res.body.total).toBe(1);
+    });
+
+    it('returns 200 with correct page and limit when provided', async () => {
+      mockPrisma.appointment.findMany.mockResolvedValue([]);
+      mockPrisma.appointment.count.mockResolvedValue(50);
+
+      const res = await request(app.getHttpServer())
+        .get('/appointments?page=2&limit=10')
+        .expect(200);
+
+      expect(res.body.page).toBe(2);
+      expect(res.body.limit).toBe(10);
+      expect(res.body.total).toBe(50);
     });
   });
 

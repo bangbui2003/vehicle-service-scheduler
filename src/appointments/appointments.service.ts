@@ -1,10 +1,11 @@
 import {
+  BadRequestException,
   ConflictException,
   Injectable,
   Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { Appointment, AppointmentStatus } from '@prisma/client';
+import { Appointment, AppointmentStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AvailabilityService } from '../availability/availability.service';
 import { CreateAppointmentDto } from './dto/create-appointment.dto';
@@ -20,6 +21,11 @@ export class AppointmentsService {
 
   async create(dto: CreateAppointmentDto): Promise<Appointment> {
     const startTime = new Date(dto.desiredStartTime);
+
+    if (startTime <= new Date()) {
+      throw new BadRequestException('Appointment start time must be in the future');
+    }
+
     const endTime = this.availabilityService.computeEndTime(
       startTime,
       dto.serviceType,
@@ -131,8 +137,14 @@ export class AppointmentsService {
     customerId?: string;
     dealershipId?: string;
     date?: string;
-  }): Promise<Appointment[]> {
-    const where: any = {};
+    page?: number;
+    limit?: number;
+  }): Promise<{ data: Appointment[]; total: number; page: number; limit: number }> {
+    const page = Math.max(1, filters.page ?? 1);
+    const limit = Math.min(100, Math.max(1, filters.limit ?? 20));
+    const skip = (page - 1) * limit;
+
+    const where: Prisma.AppointmentWhereInput = {};
 
     if (filters.customerId) where.customerId = filters.customerId;
     if (filters.dealershipId) where.dealershipId = filters.dealershipId;
@@ -143,16 +155,18 @@ export class AppointmentsService {
       where.startTime = { gte: day, lt: nextDay };
     }
 
-    return this.prisma.appointment.findMany({
-      where,
-      include: {
-        customer: true,
-        vehicle: true,
-        technician: true,
-        serviceBay: true,
-      },
-      orderBy: { startTime: 'asc' },
-    });
+    const [data, total] = await Promise.all([
+      this.prisma.appointment.findMany({
+        where,
+        include: { customer: true, vehicle: true, technician: true, serviceBay: true },
+        orderBy: { startTime: 'asc' },
+        skip,
+        take: limit,
+      }),
+      this.prisma.appointment.count({ where }),
+    ]);
+
+    return { data, total, page, limit };
   }
 
   async cancel(id: string): Promise<Appointment> {
