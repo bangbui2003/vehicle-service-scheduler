@@ -89,8 +89,9 @@ model Appointment {
   startTime    DateTime
   endTime      DateTime
   status       AppointmentStatus @default(CONFIRMED)
-  notes        String?
-  createdAt    DateTime          @default(now())
+  notes          String?
+  idempotencyKey String?           @unique
+  createdAt      DateTime          @default(now())
   updatedAt    DateTime          @updatedAt
 
   @@index([dealershipId, startTime])

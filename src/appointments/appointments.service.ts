@@ -8,6 +8,7 @@ import {
 import { Appointment, AppointmentStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AvailabilityService } from '../availability/availability.service';
+import { MetricsService } from '../metrics/metrics.service';
 import { CreateAppointmentDto } from './dto/create-appointment.dto';
 
 @Injectable()
@@ -17,9 +18,21 @@ export class AppointmentsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly availabilityService: AvailabilityService,
+    private readonly metrics: MetricsService,
   ) {}
 
-  async create(dto: CreateAppointmentDto): Promise<Appointment> {
+  async create(dto: CreateAppointmentDto, idempotencyKey?: string): Promise<Appointment> {
+    if (idempotencyKey) {
+      const existing = await this.prisma.appointment.findUnique({
+        where: { idempotencyKey },
+        include: { customer: true, vehicle: true, technician: true, serviceBay: true },
+      });
+      if (existing) {
+        this.logger.log({ msg: 'appointment.idempotent_hit', idempotencyKey, appointmentId: existing.id });
+        return existing;
+      }
+    }
+
     const startTime = new Date(dto.desiredStartTime);
 
     if (startTime <= new Date()) {
@@ -55,6 +68,7 @@ export class AppointmentsService {
           startTime,
           endTime,
         });
+        this.metrics.appointmentBookings.inc({ outcome: 'conflict_bay' });
         throw new ConflictException(
           'No service bay available for the requested time slot',
         );
@@ -77,6 +91,7 @@ export class AppointmentsService {
           startTime,
           endTime,
         });
+        this.metrics.appointmentBookings.inc({ outcome: 'conflict_tech' });
         throw new ConflictException(
           `No qualified technician available for ${dto.serviceType} at the requested time`,
         );
@@ -95,6 +110,7 @@ export class AppointmentsService {
           endTime,
           status: AppointmentStatus.CONFIRMED,
           notes: dto.notes,
+          idempotencyKey: idempotencyKey ?? null,
         },
         include: {
           customer: true,
@@ -105,6 +121,7 @@ export class AppointmentsService {
       });
     });
 
+    this.metrics.appointmentBookings.inc({ outcome: 'created' });
     this.logger.log({
       msg: 'appointment.created',
       appointmentId: appointment.id,
@@ -191,6 +208,7 @@ export class AppointmentsService {
       },
     });
 
+    this.metrics.appointmentBookings.inc({ outcome: 'cancelled' });
     this.logger.log({ msg: 'appointment.cancelled', appointmentId: id });
 
     return updated;

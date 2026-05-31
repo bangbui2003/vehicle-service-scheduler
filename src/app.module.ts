@@ -1,4 +1,6 @@
 import { Module } from '@nestjs/common';
+import { APP_GUARD } from '@nestjs/core';
+import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
 import { LoggerModule } from 'nestjs-pino';
 import { PrismaModule } from './prisma/prisma.module';
 import { AppointmentsModule } from './appointments/appointments.module';
@@ -8,9 +10,13 @@ import { TechniciansModule } from './technicians/technicians.module';
 import { CustomersModule } from './customers/customers.module';
 import { VehiclesModule } from './vehicles/vehicles.module';
 import { HealthModule } from './health/health.module';
+import { MetricsModule } from './metrics/metrics.module';
 
 @Module({
   imports: [
+    ThrottlerModule.forRoot([
+      { name: 'default', ttl: 60_000, limit: 60 },
+    ]),
     LoggerModule.forRoot({
       pinoHttp: {
         transport:
@@ -33,6 +39,10 @@ import { HealthModule } from './health/health.module';
     CustomersModule,
     VehiclesModule,
     HealthModule,
+    MetricsModule,
+  ],
+  providers: [
+    { provide: APP_GUARD, useClass: ThrottlerGuard },
   ],
 })
 export class AppModule {}

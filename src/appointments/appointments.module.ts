@@ -7,5 +7,6 @@ import { AvailabilityModule } from '../availability/availability.module';
   imports: [AvailabilityModule],
   controllers: [AppointmentsController],
   providers: [AppointmentsService],
+  // MetricsModule is @Global() — no import needed
 })
 export class AppointmentsModule {}

@@ -4,6 +4,7 @@ import {
   DefaultValuePipe,
   Delete,
   Get,
+  Headers,
   HttpCode,
   HttpStatus,
   Param,
@@ -11,7 +12,8 @@ import {
   Post,
   Query,
 } from '@nestjs/common';
-import { ApiOperation, ApiQuery, ApiResponse, ApiTags } from '@nestjs/swagger';
+import { Throttle, SkipThrottle } from '@nestjs/throttler';
+import { ApiHeader, ApiOperation, ApiQuery, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { AppointmentsService } from './appointments.service';
 import { CreateAppointmentDto } from './dto/create-appointment.dto';
 
@@ -21,15 +23,22 @@ export class AppointmentsController {
   constructor(private readonly appointmentsService: AppointmentsService) {}
 
   @Post()
+  @Throttle({ default: { ttl: 60_000, limit: 10 } })
   @ApiOperation({ summary: 'Create a new appointment' })
+  @ApiHeader({ name: 'X-Idempotency-Key', required: false, description: 'Optional UUID to prevent duplicate bookings on retry' })
   @ApiResponse({ status: 201, description: 'Appointment created successfully' })
   @ApiResponse({ status: 409, description: 'No available bay or technician' })
   @ApiResponse({ status: 400, description: 'Invalid request body' })
-  create(@Body() dto: CreateAppointmentDto) {
-    return this.appointmentsService.create(dto);
+  @ApiResponse({ status: 429, description: 'Too many requests' })
+  create(
+    @Body() dto: CreateAppointmentDto,
+    @Headers('x-idempotency-key') idempotencyKey?: string,
+  ) {
+    return this.appointmentsService.create(dto, idempotencyKey);
   }
 
   @Get()
+  @SkipThrottle()
   @ApiOperation({ summary: 'List appointments with optional filters and pagination' })
   @ApiQuery({ name: 'customerId', required: false })
   @ApiQuery({ name: 'dealershipId', required: false })

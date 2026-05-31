@@ -10,7 +10,7 @@ const buildMockPrisma = () => ({
   $queryRaw: jest.fn().mockResolvedValue([]),
   $transaction: jest.fn(),
   appointment: {
-    findUnique: jest.fn(),
+    findUnique: jest.fn().mockResolvedValue(null),
     findMany: jest.fn(),
     count: jest.fn().mockResolvedValue(0),
     update: jest.fn(),

@@ -3,13 +3,15 @@ import { ConflictException } from '@nestjs/common';
 import { AppointmentsService } from './appointments.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { AvailabilityService } from '../availability/availability.service';
+import { MetricsService } from '../metrics/metrics.service';
 import { CreateAppointmentDto } from './dto/create-appointment.dto';
 
 const mockPrismaService = {
   $transaction: jest.fn(),
   appointment: {
-    findUnique: jest.fn(),
+    findUnique: jest.fn().mockResolvedValue(null), // no idempotency hit by default
     findMany: jest.fn(),
+    count: jest.fn(),
     update: jest.fn(),
   },
 };
@@ -18,6 +20,10 @@ const mockAvailabilityService = {
   computeEndTime: jest.fn(),
   findAvailableBay: jest.fn(),
   findAvailableTechnician: jest.fn(),
+};
+
+const mockMetricsService = {
+  appointmentBookings: { inc: jest.fn() },
 };
 
 describe('AppointmentsService', () => {
@@ -29,6 +35,7 @@ describe('AppointmentsService', () => {
         AppointmentsService,
         { provide: PrismaService, useValue: mockPrismaService },
         { provide: AvailabilityService, useValue: mockAvailabilityService },
+        { provide: MetricsService, useValue: mockMetricsService },
       ],
     }).compile();
 
