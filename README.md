@@ -94,28 +94,52 @@ yarn test:watch
 
 ## API Overview
 
-| Method | Endpoint | Description |
-|---|---|---|
-| `POST` | `/appointments` | Book an appointment |
-| `GET` | `/appointments` | List appointments |
-| `GET` | `/appointments/:id` | Get appointment |
-| `DELETE` | `/appointments/:id` | Cancel appointment |
-| `GET` | `/health` | Health check |
+### Appointments
 
-Full API docs with request/response schemas: `http://localhost:3000/api/docs`
+| Method | Endpoint | Description |
+| --- | --- | --- |
+| `POST` | `/appointments` | Book an appointment (supports `X-Idempotency-Key` header) |
+| `GET` | `/appointments` | List with filters (customerId, dealershipId, date) + pagination |
+| `GET` | `/appointments/:id` | Get single appointment |
+| `PATCH` | `/appointments/:id/status` | Transition status via state machine |
+| `DELETE` | `/appointments/:id` | Cancel appointment |
+
+### Slot Discovery
+
+| Method | Endpoint | Description |
+| --- | --- | --- |
+| `GET` | `/slots/next-available` | Find next available slot (3-query algorithm, up to 7 days ahead) |
+
+### Management
+
+| Method | Endpoint | Description |
+| --- | --- | --- |
+| `POST/GET/DELETE` | `/customers` | Customer CRUD |
+| `POST/GET/DELETE` | `/vehicles` | Vehicle CRUD (filter by customerId) |
+| `POST/GET/DELETE` | `/service-bays` | ServiceBay CRUD (filter by dealershipId) |
+| `POST/GET/DELETE` | `/technicians` | Technician CRUD (filter by dealershipId) |
+
+### Operations
+
+| Method | Endpoint | Description |
+| --- | --- | --- |
+| `GET` | `/health` | Health check — returns 200 or 503 |
+| `GET` | `/metrics` | Prometheus metrics (booking outcomes, Node.js runtime) |
+
+Full interactive docs: `http://localhost:3000/api/docs`
 
 ### Example: Book an Appointment
 
 ```bash
 curl -X POST http://localhost:3000/appointments \
   -H "Content-Type: application/json" \
+  -H "X-Idempotency-Key: <uuid>" \
   -d '{
     "customerId": "<uuid>",
     "vehicleId": "<uuid>",
     "dealershipId": "<uuid>",
     "serviceType": "OIL_CHANGE",
-    "desiredStartTime": "2026-06-01T09:00:00.000Z",
-    "notes": "Please check tyre pressure too"
+    "desiredStartTime": "2026-07-01T09:00:00.000Z"
   }'
 ```
 
@@ -132,6 +156,14 @@ curl -X POST http://localhost:3000/appointments \
   ...
 }
 ```
+
+### Headers
+
+- `X-Idempotency-Key`: optional but recommended on `POST /appointments` to make create requests idempotent across retries. The service honours idempotency for identical payloads within a short TTL (see production notes).
+
+### Rate limiting
+
+- The API enforces rate limiting to protect against abusive clients. When a client exceeds the allowed request rate the server returns `429 Too Many Requests`. In production this is implemented via `@nestjs/throttler` with sensible per-route defaults; clients should respect `Retry-After` when present.
 
 **Conflict (409):**
 ```json

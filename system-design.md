@@ -18,20 +18,26 @@ flowchart TD
 
         subgraph Ctrl["Controllers"]
             AC["AppointmentsController<br/>POST / GET / DELETE /appointments"]
+            SC["SlotsController<br/>GET /slots/next-available"]
             CC["CustomersController"]
             VC["VehiclesController"]
             SBC["ServiceBaysController"]
             TC["TechniciansController"]
+            MC["MetricsController<br/>GET /metrics"]
             HC["HealthController<br/>GET /health"]
         end
 
         subgraph SvcLayer["Services"]
             AS["AppointmentsService<br/>create / findAll / findOne / cancel"]
+            SS["SlotsService<br/>nextAvailable / helpers"]
             CS["CustomersService"]
             VS["VehiclesService"]
             SBS["ServiceBaysService"]
             TS["TechniciansService"]
+            MS["MetricsService<br/>prom-client metrics collectors"]
         end
+
+        EL["AppointmentEventsListener<br/>consumes appointment.created / appointment.cancelled"]
 
         AV["AvailabilityService<br/>findAvailableBay / findAvailableTechnician<br/>SELECT FOR UPDATE SKIP LOCKED"]
         PS["PrismaService - Global<br/>transaction / queryRaw"]
@@ -55,6 +61,10 @@ flowchart TD
     HC --> PS
 
     AS -->|"inside transaction"| AV
+    AC --> EL
+    AS --> EL
+    SC --> SS
+    MC --> MS
     AV -->|"raw SQL"| PS
     AS --> PS
     CS --> PS
@@ -207,6 +217,10 @@ This covers all overlap cases: full overlap, partial start overlap, partial end 
 | **class-validator + class-transformer** | DTO validation | Declarative validation via decorators on DTO classes — no hand-written validation logic. Integrates directly with NestJS `ValidationPipe`. |
 | **@nestjs/swagger** | API documentation | Generates interactive OpenAPI docs from decorators already present on controllers and DTOs. Zero maintenance cost — docs update when code updates. |
 | **nestjs-pino** | Structured logging | Pino is the fastest Node.js JSON logger. Structured logs (JSON objects rather than interpolated strings) are directly ingestible by log aggregators (Datadog, CloudWatch, ELK). |
+| **@nestjs/throttler** | Rate limiting | Protects endpoints from abusive clients and ensures predictable resource usage by returning `429 Too Many Requests` when limits are exceeded. |
+| **prom-client** | Metrics collection | Prometheus-compatible metrics exposition used by `MetricsModule` to expose `GET /metrics`. |
+| **@nestjs/event-emitter** | Domain events | Lightweight in-process event emitter used to publish `appointment.*` events for decoupled side-effects (notifications, analytics). |
+| **OpenTelemetry** | Tracing | Distributed tracing instrumentation to trace the critical path (`POST /appointments`) across DB and internal services. |
 | **@nestjs/terminus** | Health checks | Standard health check library for NestJS. Provides the `GET /health` endpoint used by container orchestrators to probe readiness. |
 | **Jest + ts-jest** | Unit testing | Standard testing framework for Node.js. `ts-jest` allows tests to run directly against TypeScript source without a separate compile step. |
 | **Docker + docker-compose** | Container runtime | Provides a reproducible environment. `docker-compose` brings up PostgreSQL for local development with a single command. |
@@ -251,22 +265,19 @@ In **development**, `pino-pretty` formats logs for human readability. In **produ
 
 This endpoint is designed to be polled by container orchestrators (Docker health check, Kubernetes liveness/readiness probes) to automatically restart or remove unhealthy instances.
 
-### Metrics (Production Recommendation)
+### Metrics (Implemented)
 
-Not implemented in this assessment but the recommended approach for production:
+Metrics are implemented in this assessment via `prom-client` and exposed at `GET /metrics`:
 
-- Add a Prometheus adapter (e.g. `nestjs-prometheus`) to expose a `GET /metrics` endpoint in Prometheus format.
-- Track: `http_requests_total` (by route/method/status), `http_request_duration_ms` (histogram), `appointment_bookings_total` (by outcome: created/conflict_bay/conflict_tech/cancelled), `db_pool_size`.
-- Scrape with Prometheus, visualize with Grafana.
+- `appointment_bookings_total` (labels: outcome=created|conflict_bay|conflict_tech|cancelled)
+- `http_request_duration_ms` (histogram by route/method)
+- Node.js runtime metrics (heap, event loop lag)
 
-### Tracing (Production Recommendation)
+Scrape with Prometheus and visualize with Grafana.
 
-Not implemented in this assessment but the recommended approach for production:
+### Tracing (Implemented)
 
-- Instrument with **OpenTelemetry** (`@opentelemetry/sdk-node`, `@opentelemetry/auto-instrumentations-node`).
-- Propagate `trace-id` across HTTP requests and database queries.
-- Export spans to Jaeger or Datadog APM.
-- This provides end-to-end visibility into the `POST /appointments` critical path — particularly useful for diagnosing slow transaction lock acquisition under load.
+Basic tracing is implemented using **OpenTelemetry** instrumentation. Traces propagate through the HTTP layer and the Prisma DB calls, and spans are exported to the configured OTLP exporter (Jaeger/Datadog). This gives end-to-end visibility into `POST /appointments` and helps diagnose latency caused by lock acquisition or DB contention.
 
 ### Correlation IDs
 
@@ -324,6 +335,14 @@ if (startTime <= new Date()) {
 **Decision:** Both availability queries run inside a single `$transaction` with `FOR UPDATE SKIP LOCKED` on the resource rows. The first transaction to acquire the lock proceeds; the second skips the locked row and either claims a different resource or returns 409 immediately — no waiting, no deadlock.
 
 This is the only pattern that solves the double-booking problem at the database level without introducing an external dependency (Redis, distributed mutex) or a retry loop (optimistic locking).
+
+### Idempotency on create
+
+`POST /appointments` supports an `X-Idempotency-Key` header. Clients are strongly encouraged to send a stable idempotency key when retrying create operations (for example on network timeouts). The server stores the recent idempotency keys for a short TTL and returns the same result for identical requests bearing the same key.
+
+### Rate limiting
+
+The application enforces rate limiting using `@nestjs/throttler`. In production the default limits are tightened per-route (e.g., lower limits on `POST /appointments`) to protect backend resources; exceeding the rate returns `429 Too Many Requests` with an optional `Retry-After` header.
 
 ### Type-Safe Query Filters
 
