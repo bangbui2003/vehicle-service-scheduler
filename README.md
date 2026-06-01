@@ -187,43 +187,54 @@ prisma/
 
 ### My Role vs. the AI's Role
 
-My approach was to **design first, then direct AI to implement**. Every architectural decision in this project was mine — I used Claude (Anthropic) as an accelerator for implementation, not as the decision-maker.
+I treated the AI as a senior developer who executes well but needs architectural direction. My job was to design the system, define constraints, and review everything critically. The AI's job was to accelerate implementation of decisions I had already made.
 
-### How I Directed the AI
+Every significant design decision in this project was reached independently before AI wrote a single line of code. The five most interesting ones are below.
 
-**1. I identified the core problem before involving AI.**
-The central challenge in this scenario is preventing double-booking under concurrent load. I recognised this as a classic read-then-write race condition before writing a single line of code. I researched the available patterns — optimistic locking, pessimistic locking, and application-level mutexes — and independently concluded that `SELECT FOR UPDATE SKIP LOCKED` inside a database transaction was the appropriate fit for this read-then-write pattern with low contention.
+### Five Architectural Debates
 
-I then asked Claude to implement this specific pattern rather than asking it to "solve double-booking" and accepting whatever it suggested.
+**1. Concurrency strategy — I set the direction before asking AI anything.**
 
-**2. I set constraints before asking for output.**
-Before any scaffolding, I defined the module boundaries, the transaction ownership (the service layer, not the controller), and the error contract (409 for resource conflicts, 404 for not found). Claude generated code within a design I had already validated.
+I identified double-booking under concurrent load as the hardest problem in this scenario before writing a single line of code. I researched three patterns independently — optimistic locking with retries, pessimistic locking with `SELECT FOR UPDATE`, and application-level mutexes with Redis — and concluded that `SELECT FOR UPDATE SKIP LOCKED` was the correct fit: non-blocking, no external dependency, no retry storm. I then asked Claude to implement that specific pattern. It did not choose the pattern; it implemented the pattern I had already validated against the PostgreSQL 16 documentation.
 
-**3. I caught and corrected AI mistakes.**
+**2. State machine — I rejected the naive if-else approach.**
 
-During review I identified several issues in Claude's initial output:
+When I asked Claude to implement appointment status transitions, it generated nested `if-else` blocks checking current status inline. I rejected this immediately: adding a future status (e.g. `RESCHEDULED`) would require modifying multiple conditional branches — a maintenance hazard. I directed it to use an `ALLOWED_TRANSITIONS` lookup table — a declarative map of `currentStatus → allowedNextStatuses[]`. The validation logic becomes a two-line map lookup. Adding a new status requires one new map entry, not a code change.
 
-- The `AvailabilityService` spec did not test `findAvailableBay` or `findAvailableTechnician` — the two most critical methods. I directed Claude to add these tests with correct mock setup on the transaction client, not on the PrismaService directly.
-- The `app.module.ts` imported five modules that did not yet exist, which would have broken the build silently. I caught this by cross-referencing the import list against the actual file tree.
-- The `HealthController` did not wrap database errors in `HealthCheckError`, meaning the `/health` endpoint returned `500` instead of `503` on DB failure. I identified this via the failing e2e test and directed the fix.
+**3. Next-available slot — I caught an O(n) query problem and redesigned the algorithm.**
 
-**4. I validated every architectural claim against documentation.**
+When I asked Claude to implement `GET /slots/next-available`, its first proposal iterated through 30-minute windows sequentially and ran one DB query per window. For a 7-day search at 30-minute resolution, that is 336 DB queries per API call — unacceptable. I rejected this and designed a 3-query algorithm: (1) fetch all future appointments for the dealership in a single query, (2) fetch all bays and qualified technicians, (3) build in-memory occupation maps and evaluate candidate times without touching the database again. The candidate times are derived from appointment end-times — the only moments when availability can change — so the search is both exhaustive and efficient. Total cost: 3 queries regardless of search horizon.
 
-- Verified PostgreSQL `SKIP LOCKED` semantics against the PostgreSQL 16 docs to confirm it is non-blocking and does not deadlock.
-- Verified Prisma `$transaction` isolation level and confirmed that row locks are held until commit.
-- Verified the time overlap condition (`start < req_end AND end > req_start`) against five boundary cases by hand before accepting it.
+**4. Domain events — I moved the emit point from controller to service.**
+
+Claude's initial implementation placed `eventEmitter.emit()` calls in the controller. I moved them to the service layer. The reasoning: a controller's responsibility is to translate HTTP requests into service calls and return responses. It has no business knowing whether creating an appointment should trigger downstream side effects. The service layer owns the business outcome — it is the correct place to announce that a business event has occurred.
+
+**5. Data model — I rejected the join table for technician specializations.**
+
+Claude's first schema draft used a join table (`technician_specializations`) linking technicians to service types. I rejected this: a join table adds a query-time join for a field that never needs independent querying, filtering, or metadata. I directed Claude to use a PostgreSQL `text[]` array instead, enabling `serviceType = ANY(specializations)` directly in the availability query with no join. I own this trade-off: if specialization metadata (pay rates, certification expiry) were ever needed, a migration would be required.
+
+### Bugs I Caught in AI Output
+
+| Issue | How I Found It |
+|---|---|
+| `AvailabilityService` spec had zero tests for `findAvailableBay` and `findAvailableTechnician` — the two critical methods — and mocks were set up on the wrong object | Manual review of generated spec file |
+| `app.module.ts` imported five modules that did not exist — build would fail silently | Audited imports against actual file tree |
+| `HealthController` returned `500` on DB failure instead of `503` | Deliberate e2e test asserting the correct status code |
+| State machine implemented as if-else chains | Code review before accepting |
+| Next-available slot algorithm ran O(n) DB queries | Performance analysis before accepting |
 
 ### Key Decisions That Were Mine Alone
 
 | Decision | My Reasoning |
 |---|---|
-| `SELECT FOR UPDATE SKIP LOCKED` over optimistic locking | Avoids retry storms; non-blocking under contention |
-| `text[]` for technician specializations instead of a join table | No need for metadata on specializations; `ANY()` in SQL is sufficient |
-| `DELETE /appointments/:id` for cancel, not `PATCH` | Semantically clearer — the client is removing a booking, not updating a field |
-| `dealershipId` denormalized on `Appointment` | Avoids join on the most common query (list by dealership) |
-| Transaction boundary in the service layer | Keeps controllers thin; ensures atomicity is owned by business logic |
-| Separate `AvailabilityService` module | Single-responsibility; reusable if other booking flows are added |
+| `SELECT FOR UPDATE SKIP LOCKED` | Non-blocking, no retry loops, no external dependency |
+| `text[]` over join table | No join needed; `ANY()` is sufficient for the query |
+| State machine as a transition table | Extensible without touching validation logic |
+| 3-query algorithm for next-available slot | O(1) queries vs O(n) — scales with load |
+| Domain events in service layer, not controller | Layer responsibility — controllers handle HTTP, not business events |
+| Transaction boundary in service layer | Atomicity is a business logic concern, not an HTTP concern |
+| `dealershipId` denormalized on `Appointment` | Avoids join on the most common query pattern |
 
 ### Quality Assurance
 
-All AI-generated code was reviewed line-by-line before being accepted. The unit test suite (15 tests) and e2e test suite (17 tests) were written to validate behavior at the HTTP layer and service layer respectively. Tests were reviewed to ensure they tested outcomes, not internal implementation details.
+All AI-generated code was reviewed line-by-line before being accepted. The test suite (15 unit + 18 e2e = 33 total) validates business behavior at both the service and HTTP layers. Tests were reviewed to confirm they assert outcomes, not implementation details.

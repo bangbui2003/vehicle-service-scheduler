@@ -9,6 +9,7 @@ import {
   HttpStatus,
   Param,
   ParseIntPipe,
+  Patch,
   Post,
   Query,
 } from '@nestjs/common';
@@ -16,6 +17,7 @@ import { Throttle, SkipThrottle } from '@nestjs/throttler';
 import { ApiHeader, ApiOperation, ApiQuery, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { AppointmentsService } from './appointments.service';
 import { CreateAppointmentDto } from './dto/create-appointment.dto';
+import { UpdateAppointmentStatusDto } from './dto/update-appointment-status.dto';
 
 @ApiTags('appointments')
 @Controller('appointments')
@@ -56,11 +58,21 @@ export class AppointmentsController {
   }
 
   @Get(':id')
+  @SkipThrottle()
   @ApiOperation({ summary: 'Get a single appointment by ID' })
   @ApiResponse({ status: 200, description: 'Appointment found' })
   @ApiResponse({ status: 404, description: 'Appointment not found' })
   findOne(@Param('id') id: string) {
     return this.appointmentsService.findOne(id);
+  }
+
+  @Patch(':id/status')
+  @ApiOperation({ summary: 'Update appointment status (state machine)' })
+  @ApiResponse({ status: 200, description: 'Status updated' })
+  @ApiResponse({ status: 400, description: 'Cannot set IN_PROGRESS before start time' })
+  @ApiResponse({ status: 409, description: 'Invalid state transition' })
+  updateStatus(@Param('id') id: string, @Body() dto: UpdateAppointmentStatusDto) {
+    return this.appointmentsService.updateStatus(id, dto);
   }
 
   @Delete(':id')

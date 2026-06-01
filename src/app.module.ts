@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { APP_GUARD } from '@nestjs/core';
 import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
+import { EventEmitterModule } from '@nestjs/event-emitter';
 import { LoggerModule } from 'nestjs-pino';
 import { PrismaModule } from './prisma/prisma.module';
 import { AppointmentsModule } from './appointments/appointments.module';
@@ -11,12 +12,13 @@ import { CustomersModule } from './customers/customers.module';
 import { VehiclesModule } from './vehicles/vehicles.module';
 import { HealthModule } from './health/health.module';
 import { MetricsModule } from './metrics/metrics.module';
+import { SlotsModule } from './slots/slots.module';
+import { AppointmentEventsListener } from './events/appointment-events.listener';
 
 @Module({
   imports: [
-    ThrottlerModule.forRoot([
-      { name: 'default', ttl: 60_000, limit: 60 },
-    ]),
+    EventEmitterModule.forRoot(),
+    ThrottlerModule.forRoot([{ name: 'default', ttl: 60_000, limit: 60 }]),
     LoggerModule.forRoot({
       pinoHttp: {
         transport:
@@ -40,9 +42,11 @@ import { MetricsModule } from './metrics/metrics.module';
     VehiclesModule,
     HealthModule,
     MetricsModule,
+    SlotsModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: ThrottlerGuard },
+    AppointmentEventsListener,
   ],
 })
 export class AppModule {}

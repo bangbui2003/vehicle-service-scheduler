@@ -5,11 +5,25 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import { Appointment, AppointmentStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AvailabilityService } from '../availability/availability.service';
 import { MetricsService } from '../metrics/metrics.service';
 import { CreateAppointmentDto } from './dto/create-appointment.dto';
+import { UpdateAppointmentStatusDto } from './dto/update-appointment-status.dto';
+import {
+  AppointmentCreatedEvent,
+  AppointmentCancelledEvent,
+  AppointmentStatusChangedEvent,
+} from '../events/appointment.events';
+
+const ALLOWED_TRANSITIONS: Record<AppointmentStatus, AppointmentStatus[]> = {
+  [AppointmentStatus.CONFIRMED]:   [AppointmentStatus.IN_PROGRESS, AppointmentStatus.CANCELLED],
+  [AppointmentStatus.IN_PROGRESS]: [AppointmentStatus.COMPLETED, AppointmentStatus.CANCELLED],
+  [AppointmentStatus.COMPLETED]:   [],
+  [AppointmentStatus.CANCELLED]:   [],
+};
 
 @Injectable()
 export class AppointmentsService {
@@ -19,6 +33,7 @@ export class AppointmentsService {
     private readonly prisma: PrismaService,
     private readonly availabilityService: AvailabilityService,
     private readonly metrics: MetricsService,
+    private readonly eventEmitter: EventEmitter2,
   ) {}
 
   async create(dto: CreateAppointmentDto, idempotencyKey?: string): Promise<Appointment> {
@@ -128,8 +143,40 @@ export class AppointmentsService {
       technicianId: appointment.technicianId,
       serviceBayId: appointment.serviceBayId,
     });
+    this.eventEmitter.emit('appointment.created', new AppointmentCreatedEvent(appointment));
 
     return appointment;
+  }
+
+  async updateStatus(id: string, dto: UpdateAppointmentStatusDto): Promise<Appointment> {
+    const appointment = await this.findOne(id);
+    const allowed = ALLOWED_TRANSITIONS[appointment.status];
+
+    if (!allowed.includes(dto.status)) {
+      throw new ConflictException(
+        `Cannot transition from ${appointment.status} to ${dto.status}`,
+      );
+    }
+
+    if (dto.status === AppointmentStatus.IN_PROGRESS && new Date() < appointment.startTime) {
+      throw new BadRequestException(
+        'Cannot mark appointment as IN_PROGRESS before its scheduled start time',
+      );
+    }
+
+    const updated = await this.prisma.appointment.update({
+      where: { id },
+      data: { status: dto.status },
+      include: { customer: true, vehicle: true, technician: true, serviceBay: true },
+    });
+
+    this.logger.log({ msg: 'appointment.status_changed', appointmentId: id, from: appointment.status, to: dto.status });
+    this.eventEmitter.emit(
+      'appointment.status_changed',
+      new AppointmentStatusChangedEvent(updated, appointment.status),
+    );
+
+    return updated;
   }
 
   async findOne(id: string): Promise<Appointment> {
@@ -210,6 +257,7 @@ export class AppointmentsService {
 
     this.metrics.appointmentBookings.inc({ outcome: 'cancelled' });
     this.logger.log({ msg: 'appointment.cancelled', appointmentId: id });
+    this.eventEmitter.emit('appointment.cancelled', new AppointmentCancelledEvent(updated));
 
     return updated;
   }

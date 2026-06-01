@@ -363,25 +363,37 @@ I asked Claude to critique this boundary. It confirmed the design was sound and 
 
 **Overlap logic — I verified the SQL before accepting it.** When I asked Claude to express the time-window conflict condition in SQL, it produced `start_time < req_end AND end_time > req_start`. I tested this against five cases by hand: full overlap, partial-left overlap, partial-right overlap, containment, and back-to-back (the boundary case that must NOT conflict). All five were correct before I accepted the expression.
 
+**State machine — I rejected the naive if-else approach.** When I asked Claude to implement `PATCH /appointments/:id/status`, it generated a nested series of `if-else` blocks checking the current status. I rejected this because adding a new status would require modifying multiple branches. I directed it to use a `ALLOWED_TRANSITIONS` lookup table — a declarative map of `currentStatus → []allowedNextStatuses`. Adding a new status in future requires adding one entry to the map, not touching the validation logic.
+
+**Next-available slot — I identified the algorithmic bottleneck.** Claude's first proposal for `GET /slots/next-available` iterated through 30-minute windows sequentially, running one DB query per window — O(n) queries for a 7-day search horizon (336 queries). I rejected this and designed a 3-query algorithm: fetch all future appointments once, build in-memory occupation maps, collect candidate times from appointment end-times (the only moments availability can change), then evaluate candidates in memory. The result is O(1) queries regardless of search horizon and O(m log m) time where m is the number of existing appointments.
+
+**Domain events — I moved the emit point.** Claude placed `eventEmitter.emit()` calls in the controller. I moved them to the service layer: controllers handle HTTP concerns; business events are a service-layer concept. A controller has no business knowing whether an appointment creation should trigger downstream side effects.
+
 ### Phase 3: Implementation (AI-generated, me-reviewed)
 
-With the design fully specified, I directed Claude to scaffold the modules, DTOs, services, and test stubs. I reviewed every generated file before accepting it. Three issues required correction:
+With the design fully specified, I directed Claude to scaffold the modules, DTOs, services, and test stubs. I reviewed every generated file before accepting it. Five issues required correction:
 
-**Issue 1 — Missing test coverage on critical methods.** Claude's `AvailabilityService` spec omitted tests for `findAvailableBay` and `findAvailableTechnician` — the two methods containing the concurrency logic. The mocks were also set up against the top-level `PrismaService` rather than the transaction client `tx` passed into those methods. I identified this gap, specified the correct mock structure, and directed the fix.
+**Issue 1 — Missing test coverage on critical methods.** Claude's `AvailabilityService` spec omitted tests for `findAvailableBay` and `findAvailableTechnician` — the two methods containing the concurrency logic. The mocks were also set up against the top-level `PrismaService` rather than the transaction client `tx`. I identified this gap, specified the correct mock structure, and directed the fix.
 
-**Issue 2 — Broken module imports.** `app.module.ts` imported five modules (`CustomersModule`, `VehiclesModule`, `ServiceBaysModule`, `TechniciansModule`, `HealthModule`) that had not been created yet. The build would have failed. I caught this by auditing the import list against the actual file tree and directed Claude to implement all missing modules.
+**Issue 2 — Broken module imports.** `app.module.ts` imported five modules that had not been created yet. The build would have failed silently. I caught this by auditing the import list against the actual file tree.
 
-**Issue 3 — Incorrect HTTP status on health failure.** The initial `HealthController` did not wrap database errors in `@nestjs/terminus`'s `HealthCheckError`, causing the endpoint to return `500` on DB failure instead of `503`. I caught this through a deliberate e2e test that asserted the correct status code, then directed the fix.
+**Issue 3 — Incorrect HTTP status on health failure.** The initial `HealthController` returned `500` on DB failure instead of `503`. I caught this through a deliberate e2e test and directed the fix using `HealthCheckError`.
+
+**Issue 4 — O(n) queries in next-available slot.** Described above — rejected and redesigned to 3 queries.
+
+**Issue 5 — State machine as if-else chains.** Described above — rejected and redesigned to a transition table.
 
 ### Summary
 
 | Decision or Task | Owner |
 | --- | --- |
-| Concurrency pattern selection (`SKIP LOCKED`) | **Me** — researched and validated before involving AI |
-| Transaction boundary placement (service layer) | **Me** — defined upfront as an architectural constraint |
-| `text[]` over join table for specializations | **Me** — rejected AI's first proposal and directed the revision |
-| Overlap SQL condition verification | **Me** — verified against five boundary cases independently |
-| API shape (`DELETE` for cancel, filter params) | **Me** — all HTTP contract decisions |
-| Module scaffolding and boilerplate | AI-generated, reviewed and corrected by me |
-| Test stubs | AI-generated, expanded and corrected by me |
-| Bug fixes (missing tests, broken imports, wrong status code) | **Me** — identified all three issues, directed all three fixes |
+| Concurrency pattern (`SKIP LOCKED`) | **Me** — researched and validated before involving AI |
+| Transaction boundary in service layer | **Me** — defined upfront as architectural constraint |
+| `text[]` over join table for specializations | **Me** — rejected AI's first proposal |
+| Overlap SQL condition | **Me** — verified against five boundary cases |
+| State machine as transition table (not if-else) | **Me** — rejected AI's naive implementation |
+| Next-available slot: 3-query algorithm (not O(n) queries) | **Me** — identified bottleneck, designed the algorithm |
+| Domain event emit point (service, not controller) | **Me** — architectural decision on layer responsibility |
+| API shape and HTTP contract | **Me** — all endpoint and status code decisions |
+| Module scaffolding, boilerplate, test stubs | AI-generated, reviewed and corrected by me |
+| Bug fixes (5 issues caught and directed) | **Me** — identified all, directed all fixes |

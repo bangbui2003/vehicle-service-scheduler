@@ -1,5 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { ConflictException } from '@nestjs/common';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import { AppointmentsService } from './appointments.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { AvailabilityService } from '../availability/availability.service';
@@ -26,6 +27,10 @@ const mockMetricsService = {
   appointmentBookings: { inc: jest.fn() },
 };
 
+const mockEventEmitter = {
+  emit: jest.fn(),
+};
+
 describe('AppointmentsService', () => {
   let service: AppointmentsService;
 
@@ -36,6 +41,7 @@ describe('AppointmentsService', () => {
         { provide: PrismaService, useValue: mockPrismaService },
         { provide: AvailabilityService, useValue: mockAvailabilityService },
         { provide: MetricsService, useValue: mockMetricsService },
+        { provide: EventEmitter2, useValue: mockEventEmitter },
       ],
     }).compile();
 
