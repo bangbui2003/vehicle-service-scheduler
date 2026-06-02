@@ -177,12 +177,13 @@ curl -X POST http://localhost:3000/appointments \
 
 | Type | Duration |
 |---|---|
-| `OIL_CHANGE` | 60 min |
+| `OIL_CHANGE` | 45 min |
 | `TIRE_ROTATION` | 45 min |
 | `BRAKE_REPAIR` | 120 min |
 | `FULL_SERVICE` | 180 min |
 | `INSPECTION` | 30 min |
 | `BATTERY_REPLACEMENT` | 45 min |
+| `TIRE_REPLACEMENT` | 90 min |
 
 ---
 
@@ -217,58 +218,22 @@ prisma/
 
 ## AI Collaboration Narrative
 
-### My Role vs. the AI's Role
+### High-Level Strategy: Design First, Delegate Second
 
-I treated the AI as a senior developer who executes well but needs architectural direction. My job was to design the system, define constraints, and review everything critically. The AI's job was to accelerate implementation of decisions I had already made.
+I treated the AI as a fast-typing junior developer who needs strict architectural boundaries. My strategy was to make every core architectural decision independently before scaffolding, and then use AI to accelerate the boilerplate implementation. I explicitly constrained the AI from over-engineering (e.g., forbidding Redis or external message brokers) to ensure the system remained atomic and PostgreSQL-native.
 
-For example, during the refinement phase, I directed the AI to add key domain constraints (database-backed idempotency using PostgreSQL, dynamic service duration calculation via a `ServiceCatalog`, and timezone-aware UTC operating hours checks) to elevate the production readiness of our solution. To prove that our concurrency controls perform perfectly under pressure, I instructed the AI to write a specific E2E test using `Promise.all()` that fires 5 concurrent booking requests to the same slot, confirming that exactly 1 request succeeds and 4 fail with 409 Conflict. I strictly constrained the implementation to prevent over-engineering: no Redis, no message brokers, and no distributed locks. The entire flow remains atomic, lightweight, and contained within PostgreSQL.
+### Process for Refining AI Output
 
-Every significant design decision in this project was reached independently before AI wrote a single line of code. The five most interesting ones are below.
+When the AI generated naive solutions, I actively overruled them to enforce production-grade patterns:
+1. **Concurrency & Idempotency:** The AI's reflex for preventing double-booking and handling idempotency was to add a Redis cache. I rejected this and forced a pure PostgreSQL approach using `SELECT FOR UPDATE SKIP LOCKED` and an atomic `idempotency_records` table.
+2. **Algorithmic Complexity:** For slot discovery (`GET /slots/next-available`), the AI wrote a loop executing a database query per 30-minute window (O(n)). I scrapped this and designed a 3-query in-memory algorithm (O(1)).
+3. **Event-Driven Architecture:** The AI placed `EventEmitter` calls in the controllers. I moved them to the service layer and subsequently upgraded the pattern to a true **Transactional Outbox**, ensuring domain events are persisted atomically alongside the booking.
+4. **Pagination:** The AI defaulted to offset-based pagination. I directed it to implement **Cursor-based Pagination** for O(1) seek performance at scale.
+5. **State Machine:** The AI used nested `if-else` blocks for status updates. I forced a refactor into a declarative `ALLOWED_TRANSITIONS` map to eliminate fragile branching logic.
 
-### Five Architectural Debates
+### Verification and Quality Assurance
 
-**1. Concurrency strategy — I set the direction before asking AI anything.**
-
-I identified double-booking under concurrent load as the hardest problem in this scenario before writing a single line of code. I researched three patterns independently — optimistic locking with retries, pessimistic locking with `SELECT FOR UPDATE`, and application-level mutexes with Redis — and concluded that `SELECT FOR UPDATE SKIP LOCKED` was the correct fit: non-blocking, no external dependency, no retry storm. I then asked Claude to implement that specific pattern. It did not choose the pattern; it implemented the pattern I had already validated against the PostgreSQL 16 documentation.
-
-**2. State machine — I rejected the naive if-else approach.**
-
-When I asked Claude to implement appointment status transitions, it generated nested `if-else` blocks checking current status inline. I rejected this immediately: adding a future status (e.g. `RESCHEDULED`) would require modifying multiple conditional branches — a maintenance hazard. I directed it to use an `ALLOWED_TRANSITIONS` lookup table — a declarative map of `currentStatus → allowedNextStatuses[]`. The validation logic becomes a two-line map lookup. Adding a new status requires one new map entry, not a code change.
-
-**3. Next-available slot — I caught an O(n) query problem and redesigned the algorithm.**
-
-When I asked Claude to implement `GET /slots/next-available`, its first proposal iterated through 30-minute windows sequentially and ran one DB query per window. For a 7-day search at 30-minute resolution, that is 336 DB queries per API call — unacceptable. I rejected this and designed a 3-query algorithm: (1) fetch all future appointments for the dealership in a single query, (2) fetch all bays and qualified technicians, (3) build in-memory occupation maps and evaluate candidate times without touching the database again. The candidate times are derived from appointment end-times — the only moments when availability can change — so the search is both exhaustive and efficient. Total cost: 3 queries regardless of search horizon.
-
-**4. Domain events — I moved the emit point from controller to service.**
-
-Claude's initial implementation placed `eventEmitter.emit()` calls in the controller. I moved them to the service layer. The reasoning: a controller's responsibility is to translate HTTP requests into service calls and return responses. It has no business knowing whether creating an appointment should trigger downstream side effects. The service layer owns the business outcome — it is the correct place to announce that a business event has occurred.
-
-**5. Data model — I rejected the join table for technician specializations.**
-
-Claude's first schema draft used a join table (`technician_specializations`) linking technicians to service types. I rejected this: a join table adds a query-time join for a field that never needs independent querying, filtering, or metadata. I directed Claude to use a PostgreSQL `text[]` array instead, enabling `serviceType = ANY(specializations)` directly in the availability query with no join. I own this trade-off: if specialization metadata (pay rates, certification expiry) were ever needed, a migration would be required.
-
-### Bugs I Caught in AI Output
-
-| Issue | How I Found It |
-|---|---|
-| `AvailabilityService` spec had zero tests for `findAvailableBay` and `findAvailableTechnician` — the two critical methods — and mocks were set up on the wrong object | Manual review of generated spec file |
-| `app.module.ts` imported five modules that did not exist — build would fail silently | Audited imports against actual file tree |
-| `HealthController` returned `500` on DB failure instead of `503` | Deliberate e2e test asserting the correct status code |
-| State machine implemented as if-else chains | Code review before accepting |
-| Next-available slot algorithm ran O(n) DB queries | Performance analysis before accepting |
-
-### Key Decisions That Were Mine Alone
-
-| Decision | My Reasoning |
-|---|---|
-| `SELECT FOR UPDATE SKIP LOCKED` | Non-blocking, no retry loops, no external dependency |
-| `text[]` over join table | No join needed; `ANY()` is sufficient for the query |
-| State machine as a transition table | Extensible without touching validation logic |
-| 3-query algorithm for next-available slot | O(1) queries vs O(n) — scales with load |
-| Domain events in service layer, not controller | Layer responsibility — controllers handle HTTP, not business events |
-| Transaction boundary in service layer | Atomicity is a business logic concern, not an HTTP concern |
-| `dealershipId` denormalized on `Appointment` | Avoids join on the most common query pattern |
-
-### Quality Assurance
-
-All AI-generated code was reviewed line-by-line before being accepted. The test suite (15 unit + 18 e2e = 33 total) validates business behavior at both the service and HTTP layers. Tests were reviewed to confirm they assert outcomes, not implementation details.
+I ensured the final quality of the code through a strict verification process:
+- **Line-by-Line Review:** Every AI-generated file was audited. I caught and fixed several bugs, including missing test coverage on critical locking methods and incorrect HTTP status codes (returning 500 instead of 503 on DB health failure).
+- **Concurrency Testing:** To mathematically prove the AI's implementation of my `SKIP LOCKED` strategy, I designed a `Promise.all()` E2E test that fires 5 simultaneous booking requests to the exact same slot, asserting that exactly 1 succeeds (201) and 4 fail safely (409 Conflict).
+- **Comprehensive Test Suite:** The final codebase includes 24 tests (Unit & E2E) that validate core business behavior, ensuring that the AI's code accurately models the domain constraints.

@@ -444,63 +444,25 @@ The application enforces rate limiting using `@nestjs/throttler`. In production 
 
 ### Principle: Design First, Delegate Second
 
-My approach was to arrive at every significant decision independently before involving AI. Claude (Anthropic) was used as an implementation accelerator — not as an architect. The architecture, the concurrency strategy, the data model shape, and the API contract were all defined by me before AI generated a single line of code.
+My approach to using AI in the design phase was to define the architecture, data models, and concurrency strategy independently, and then use AI as a sounding board to validate constraints and explore architectural trade-offs.
 
-### Phase 1: Problem Framing (Me)
+### Brainstorming Concurrency Strategies
 
-Before opening any AI tool, I decomposed the problem into its hard constraints:
+Before finalizing the architecture, I identified double-booking under concurrent load as the hardest problem. I researched three patterns and discussed their trade-offs with AI:
+1. **Optimistic Locking with Retries**: AI suggested this initially. I rejected it because retry loops in a high-contention booking scenario can lead to retry storms and degraded performance.
+2. **Application-level Mutex (Redis)**: AI strongly recommended adding a Redis container for distributed locks. I rejected this to avoid over-engineering and infrastructure bloat.
+3. **Pessimistic Locking (`SKIP LOCKED`)**: I proposed using PostgreSQL's native `SELECT FOR UPDATE SKIP LOCKED`. I worked with the AI to verify its exact semantics—confirming that it is non-blocking, avoids deadlocks, and releases locks automatically on commit/rollback. We concluded this was the optimal design.
 
-- A booking is only valid if **both** a bay and a technician are free for the **entire** service duration simultaneously.
-- Under concurrent HTTP requests, two users could read "bay available" at the same instant and both attempt to claim it — a classic read-then-write race condition.
-- The solution must be atomic, require no external infrastructure, and degrade gracefully (return 409, not corrupt data).
+### Validating the Data Model
 
-I identified `SELECT FOR UPDATE SKIP LOCKED` inside a database transaction as the correct pattern from prior knowledge of PostgreSQL concurrency primitives. I then read the PostgreSQL 16 documentation to verify the exact semantics: that `SKIP LOCKED` is non-blocking (it does not wait on locked rows), cannot deadlock, and releases locks at transaction commit — exactly the behavior needed.
+I collaborated with the AI to refine the relational schema prior to implementation.
+- **Service Types & Specializations:** The AI initially proposed a many-to-many join table for technician specializations. I rejected this during design to avoid unnecessary query-time joins, opting instead for a `text[]` array column, enabling `serviceType = ANY(specializations)`.
+- **Idempotency Strategy:** We debated how to store idempotency keys. The AI suggested an external cache. I designed a schema using a dedicated `idempotency_records` table within PostgreSQL to ensure atomicity with the main booking transaction.
+- **Transactional Outbox:** I designed the `outbox_events` table and verified with the AI that polling it via `SKIP LOCKED` would guarantee at-least-once delivery without double-publishing in a multi-instance deployment.
 
-### Phase 2: Architecture Definition (Me, validated by AI)
+### Defining the API Contract & Pagination
 
-I defined the module boundary before scaffolding:
+- **Pagination:** For `GET /appointments`, the AI defaulted to offset-based pagination (`page` and `limit`). I recognized that this would degrade to O(N) performance at scale. During the API design phase, I directed the inclusion of a `nextCursor` property to support O(1) Cursor-Based Pagination for deep seeks.
+- **Conflict Resolution (Enriched 409):** We designed the `409 Conflict` response to not just fail, but to proactively return the `nextAvailableSlot`, reducing round-trips for the client frontend.
 
-- `AvailabilityService` owns the locking SQL and must be called **inside** the transaction, not before it.
-- `AppointmentsService` owns the transaction boundary — not the controller.
-- CRUD modules (Customers, Vehicles, etc.) are isolated from booking logic.
-
-I asked Claude to critique this boundary. It confirmed the design was sound and flagged that passing the transaction client (`tx`) into `AvailabilityService` would require a `tx as any` cast due to a Prisma TypeScript limitation — a nuance I verified by reading the Prisma source type definitions.
-
-**Data model — I rejected AI's first proposal.** Claude's initial schema draft used a join table for technician specializations. I rejected this: a join table adds a query-time join for a field that never needs independent querying. I directed Claude to use a PostgreSQL `text[]` array instead, enabling `serviceType = ANY(specializations)` in the availability query. I own this trade-off — if specialization metadata (pay rates, certifications) were ever needed, it would require a migration.
-
-**Overlap logic — I verified the SQL before accepting it.** When I asked Claude to express the time-window conflict condition in SQL, it produced `start_time < req_end AND end_time > req_start`. I tested this against five cases by hand: full overlap, partial-left overlap, partial-right overlap, containment, and back-to-back (the boundary case that must NOT conflict). All five were correct before I accepted the expression.
-
-**State machine — I rejected the naive if-else approach.** When I asked Claude to implement `PATCH /appointments/:id/status`, it generated a nested series of `if-else` blocks checking the current status. I rejected this because adding a new status would require modifying multiple branches. I directed it to use a `ALLOWED_TRANSITIONS` lookup table — a declarative map of `currentStatus → []allowedNextStatuses`. Adding a new status in future requires adding one entry to the map, not touching the validation logic.
-
-**Next-available slot — I identified the algorithmic bottleneck.** Claude's first proposal for `GET /slots/next-available` iterated through 30-minute windows sequentially, running one DB query per window — O(n) queries for a 7-day search horizon (336 queries). I rejected this and designed a 3-query algorithm: fetch all future appointments once, build in-memory occupation maps, collect candidate times from appointment end-times (the only moments availability can change), then evaluate candidates in memory. The result is O(1) queries regardless of search horizon and O(m log m) time where m is the number of existing appointments.
-
-**Domain events — I moved the emit point.** Claude placed `eventEmitter.emit()` calls in the controller. I moved them to the service layer: controllers handle HTTP concerns; business events are a service-layer concept. A controller has no business knowing whether an appointment creation should trigger downstream side effects.
-
-### Phase 3: Implementation (AI-generated, me-reviewed)
-
-With the design fully specified, I directed Claude to scaffold the modules, DTOs, services, and test stubs. I reviewed every generated file before accepting it. Five issues required correction:
-
-**Issue 1 — Missing test coverage on critical methods.** Claude's `AvailabilityService` spec omitted tests for `findAvailableBay` and `findAvailableTechnician` — the two methods containing the concurrency logic. The mocks were also set up against the top-level `PrismaService` rather than the transaction client `tx`. I identified this gap, specified the correct mock structure, and directed the fix.
-
-**Issue 2 — Broken module imports.** `app.module.ts` imported five modules that had not been created yet. The build would have failed silently. I caught this by auditing the import list against the actual file tree.
-
-**Issue 3 — Incorrect HTTP status on health failure.** The initial `HealthController` returned `500` on DB failure instead of `503`. I caught this through a deliberate e2e test and directed the fix using `HealthCheckError`.
-
-**Issue 4 — O(n) queries in next-available slot.** Described above — rejected and redesigned to 3 queries.
-
-**Issue 5 — State machine as if-else chains.** Described above — rejected and redesigned to a transition table.
-
-### Summary
-
-| Decision or Task | Owner |
-| --- | --- |
-| Concurrency pattern (`SKIP LOCKED`) | **Me** — researched and validated before involving AI |
-| Transaction boundary in service layer | **Me** — defined upfront as architectural constraint |
-| `text[]` over join table for specializations | **Me** — rejected AI's first proposal |
-| Overlap SQL condition | **Me** — verified against five boundary cases |
-| State machine as transition table (not if-else) | **Me** — rejected AI's naive implementation |
-| Next-available slot: 3-query algorithm (not O(n) queries) | **Me** — identified bottleneck, designed the algorithm |
-| Domain event emit point (service, not controller) | **Me** — architectural decision on layer responsibility |
-| API shape and HTTP contract | **Me** — all endpoint and status code decisions |
-| Module scaffolding, boilerplate, test stubs | AI-generated, reviewed and corrected by me |
-| Bug fixes (5 issues caught and directed) | **Me** — identified all, directed all fixes |
+> **Note:** For details on how AI was guided during the *implementation and coding phase* (including bug catching, test verification, and quality assurance), please refer to the **AI Collaboration Narrative** in the `README.md`.

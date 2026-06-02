@@ -296,12 +296,13 @@ describe('AppointmentsService', () => {
         total: 10,
         page: 2,
         limit: 2,
+        nextCursor: expect.any(String),
       });
       expect(mockPrismaService.appointment.findMany).toHaveBeenCalledWith(
         expect.objectContaining({
           skip: 2,
           take: 2,
-          orderBy: { startTime: 'asc' },
+          orderBy: [{ startTime: 'asc' }, { id: 'asc' }],
         }),
       );
     });
