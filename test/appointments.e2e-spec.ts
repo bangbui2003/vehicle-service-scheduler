@@ -249,7 +249,7 @@ describe('AppointmentsController (e2e)', () => {
       return request(app.getHttpServer())
         .get('/appointments')
         .expect(200)
-        .expect({ data: [], total: 0, page: 1, limit: 20 });
+        .expect({ data: [], total: 0, page: 1, limit: 20, nextCursor: null });
     });
 
     it('returns 200 and filters by dealershipId query param', async () => {

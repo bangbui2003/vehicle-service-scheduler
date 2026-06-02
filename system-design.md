@@ -35,15 +35,17 @@ flowchart TD
             SBS["ServiceBaysService"]
             TS["TechniciansService"]
             MS["MetricsService<br/>prom-client metrics collectors"]
+            OS["OutboxService<br/>persist events"]
         end
 
-        EL["AppointmentEventsListener<br/>consumes appointment.created / appointment.cancelled"]
+        OW["OutboxWorker<br/>poll & dispatch events"]
+        EL["AppointmentEventsListener<br/>consumes appointment.created / cancelled"]
 
         AV["AvailabilityService<br/>findAvailableBay / findAvailableTechnician<br/>SELECT FOR UPDATE SKIP LOCKED"]
         PS["PrismaService - Global<br/>transaction / queryRaw"]
     end
 
-    DB[("PostgreSQL 16<br/>customers / vehicles / dealerships<br/>service_bays / technicians / appointments")]
+    DB[("PostgreSQL 16<br/>customers / vehicles / dealerships<br/>service_bays / technicians / appointments<br/>outbox_events / idempotency_records")]
 
     Client -->|"HTTPS REST / JSON"| VP
     VP --> AC
@@ -61,8 +63,9 @@ flowchart TD
     HC --> PS
 
     AS -->|"inside transaction"| AV
-    AC --> EL
-    AS --> EL
+    AS -->|"inside transaction"| OS
+    OW -->|"polls"| PS
+    OW -->|"emits"| EL
     SC --> SS
     MC --> MS
     AV -->|"raw SQL"| PS
@@ -71,6 +74,7 @@ flowchart TD
     VS --> PS
     SBS --> PS
     TS --> PS
+    OS --> PS
 
     PS -->|"Prisma Client / TCP"| DB
 ```
@@ -340,6 +344,12 @@ Basic tracing is implemented using **OpenTelemetry** instrumentation. Traces pro
 
 This section documents deliberate design choices made to ensure the system is ready for real production load — not just the acceptance criteria. Each decision addresses a specific failure mode that only appears at scale or in edge cases.
 
+### Transactional Outbox Pattern
+
+**Problem without it:** Emitting domain events directly after a database commit is vulnerable to crashes. If the process dies between the database commit and the event emission, the system enters an inconsistent state (the booking exists but downstream consumers like notifications are never notified).
+
+**Decision:** Persist events into the `outbox_events` table inside the same transaction as the booking write. A background worker polls the table using `SELECT FOR UPDATE SKIP LOCKED` and dispatches the events, guaranteeing at-least-once delivery with crash safety.
+
 ### Pagination on `GET /appointments`
 
 **Problem without it:** A dealership with three years of history has hundreds of thousands of appointment records. A single `findMany` with no limit would load all of them into memory, serialize the entire result set to JSON, and either crash the server or time out the client. Additionally, standard offset pagination (`OFFSET 980`) requires PostgreSQL to scan and discard rows, leading to O(N) degradation at deep page queries.
@@ -420,11 +430,7 @@ The application enforces rate limiting using `@nestjs/throttler`. In production 
 
 **Decision:** `Prisma.AppointmentWhereInput` is used instead of `any`. TypeScript catches mismatched field names at compile time, meaning a schema rename triggers a compiler error on every query that references the old field name.
 
-### Transactional Outbox Pattern
 
-**Problem without it:** Emitting domain events directly after a database commit is vulnerable to crashes. If the process dies between the database commit and the event emission, the system enters an inconsistent state (the booking exists but downstream consumers like notifications are never notified).
-
-**Decision:** Persist events into the `outbox_events` table inside the same transaction as the booking write. A background worker polls the table using `SELECT FOR UPDATE SKIP LOCKED` and dispatches the events, guaranteeing at-least-once delivery with crash safety.
 
 ### Optimistic Locking on cancellations and status updates
 
