@@ -231,6 +231,17 @@ describe('AppointmentsController (e2e)', () => {
 
       const responses = await Promise.all(requests);
 
+      const fs = require('fs');
+      const resultsToLog = responses.map((res, index) => ({
+        requestNumber: index + 1,
+        statusCode: res.status,
+        body: res.body,
+      }));
+      fs.writeFileSync(
+        'concurrency-test-results.txt',
+        JSON.stringify(resultsToLog, null, 2)
+      );
+
       const successes = responses.filter((res) => res.status === 201);
       const conflicts = responses.filter((res) => res.status === 409);
 
