@@ -1,23 +1,14 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { ServiceBay, Technician } from '@prisma/client';
-
-// Service duration lookup in minutes
-export const SERVICE_DURATIONS: Record<string, number> = {
-  OIL_CHANGE: 60,
-  TIRE_ROTATION: 45,
-  BRAKE_REPAIR: 120,
-  FULL_SERVICE: 180,
-  INSPECTION: 30,
-  BATTERY_REPLACEMENT: 45,
-};
+import { ServiceCatalog } from '../appointments/constants/service-catalog';
 
 @Injectable()
 export class AvailabilityService {
   constructor(private readonly prisma: PrismaService) {}
 
   getServiceDuration(serviceType: string): number {
-    const duration = SERVICE_DURATIONS[serviceType.toUpperCase()];
+    const duration = ServiceCatalog[serviceType.toUpperCase()];
     if (!duration) {
       throw new Error(`Unknown service type: ${serviceType}`);
     }

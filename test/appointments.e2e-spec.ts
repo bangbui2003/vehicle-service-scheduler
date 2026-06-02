@@ -3,6 +3,10 @@ import { INestApplication, ValidationPipe } from '@nestjs/common';
 import * as request from 'supertest';
 import { AppModule } from '../src/app.module';
 import { PrismaService } from '../src/prisma/prisma.service';
+import { SlotsService } from '../src/slots/slots.service';
+import { ThrottlerGuard } from '@nestjs/throttler';
+import { OutboxWorker } from '../src/outbox/outbox-worker.service';
+ThrottlerGuard.prototype.canActivate = () => Promise.resolve(true);
 
 const buildMockPrisma = () => ({
   $connect: jest.fn().mockResolvedValue(undefined),
@@ -14,19 +18,31 @@ const buildMockPrisma = () => ({
     findMany: jest.fn(),
     count: jest.fn().mockResolvedValue(0),
     update: jest.fn(),
+    updateMany: jest.fn(),
+  },
+  outboxEvent: {
+    create: jest.fn(),
+    findMany: jest.fn().mockResolvedValue([]),
+    updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+    update: jest.fn().mockResolvedValue({}),
+  },
+  idempotencyRecord: {
+    findUnique: jest.fn().mockResolvedValue(null),
+    create: jest.fn().mockResolvedValue({}),
   },
 });
 
 describe('AppointmentsController (e2e)', () => {
   let app: INestApplication;
   let mockPrisma: ReturnType<typeof buildMockPrisma>;
+  let mockSlotsService: any;
 
   const validDto = {
     customerId: 'cust-uuid-1',
     vehicleId: 'veh-uuid-1',
     dealershipId: 'deal-uuid-1',
     serviceType: 'OIL_CHANGE',
-    desiredStartTime: '2026-06-01T09:00:00.000Z',
+    desiredStartTime: '2035-06-01T09:00:00.000Z', // In the future
   };
 
   const mockBay = { id: 'bay-1', name: 'Bay 1', dealership_id: 'deal-uuid-1' };
@@ -39,8 +55,8 @@ describe('AppointmentsController (e2e)', () => {
     technicianId: 'tech-1',
     serviceBayId: 'bay-1',
     serviceType: 'OIL_CHANGE',
-    startTime: '2026-06-01T09:00:00.000Z',
-    endTime: '2026-06-01T10:00:00.000Z',
+    startTime: '2035-06-01T09:00:00.000Z',
+    endTime: '2035-06-01T10:00:00.000Z',
     status: 'CONFIRMED',
     notes: null,
     createdAt: new Date().toISOString(),
@@ -53,12 +69,25 @@ describe('AppointmentsController (e2e)', () => {
 
   beforeAll(async () => {
     mockPrisma = buildMockPrisma();
+    mockSlotsService = {
+      findNextAvailable: jest.fn().mockResolvedValue({
+        startTime: new Date('2035-06-02T09:00:00.000Z'),
+        endTime: new Date('2035-06-02T10:00:00.000Z'),
+      }),
+    };
 
     const moduleFixture: TestingModule = await Test.createTestingModule({
       imports: [AppModule],
     })
       .overrideProvider(PrismaService)
       .useValue(mockPrisma)
+      .overrideProvider(SlotsService)
+      .useValue(mockSlotsService)
+      .overrideProvider(OutboxWorker)
+      .useValue({
+        onModuleInit: () => {},
+        onModuleDestroy: () => {},
+      })
       .compile();
 
     app = moduleFixture.createNestApplication();
@@ -66,6 +95,7 @@ describe('AppointmentsController (e2e)', () => {
       new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }),
     );
     await app.init();
+    await app.listen(0);
   });
 
   afterAll(async () => {
@@ -111,10 +141,10 @@ describe('AppointmentsController (e2e)', () => {
 
     it('returns 409 when no service bay is available', () => {
       mockPrisma.$transaction.mockImplementation(async (cb: any) => {
-        return cb({
-          $queryRaw: jest.fn().mockResolvedValue([]), // empty = no bay
-          appointment: { create: jest.fn() },
-        });
+        const txMock = {
+          $queryRaw: jest.fn().mockResolvedValue([]),
+        };
+        return cb(txMock);
       });
 
       return request(app.getHttpServer())
@@ -132,7 +162,6 @@ describe('AppointmentsController (e2e)', () => {
           $queryRaw: jest.fn()
             .mockResolvedValueOnce([mockBay])  // bay found
             .mockResolvedValueOnce([]),         // no technician
-          appointment: { create: jest.fn() },
         };
         return cb(txMock);
       });
@@ -153,6 +182,7 @@ describe('AppointmentsController (e2e)', () => {
             .mockResolvedValueOnce([mockBay])
             .mockResolvedValueOnce([mockTech]),
           appointment: { create: jest.fn().mockResolvedValue(mockAppointment) },
+          outboxEvent: { create: jest.fn().mockResolvedValue({}) },
         };
         return cb(txMock);
       });
@@ -166,6 +196,46 @@ describe('AppointmentsController (e2e)', () => {
           expect(res.body.status).toBe('CONFIRMED');
           expect(res.body.serviceType).toBe('OIL_CHANGE');
         });
+    });
+
+    it('handles 5 concurrent creation requests, allowing exactly 1 success and 4 conflicts', async () => {
+      let alreadyLocked = false;
+
+      mockPrisma.$transaction.mockImplementation(async (cb: any) => {
+        const mockBayResult = alreadyLocked ? [] : [mockBay];
+        const mockTechResult = alreadyLocked ? [] : [mockTech];
+        
+        if (!alreadyLocked) {
+          alreadyLocked = true;
+        }
+
+        const txMock = {
+          $queryRaw: jest.fn()
+            .mockResolvedValueOnce(mockBayResult)
+            .mockResolvedValueOnce(mockTechResult),
+          appointment: { create: jest.fn().mockResolvedValue(mockAppointment) },
+          idempotencyRecord: {
+            findUnique: jest.fn().mockResolvedValue(null),
+            create: jest.fn().mockResolvedValue({}),
+          },
+          outboxEvent: { create: jest.fn().mockResolvedValue({}) },
+        };
+        return cb(txMock);
+      });
+
+      const requests = Array.from({ length: 5 }).map(() =>
+        request(app.getHttpServer())
+          .post('/appointments')
+          .send(validDto)
+      );
+
+      const responses = await Promise.all(requests);
+
+      const successes = responses.filter((res) => res.status === 201);
+      const conflicts = responses.filter((res) => res.status === 409);
+
+      expect(successes).toHaveLength(1);
+      expect(conflicts).toHaveLength(4);
     });
   });
 
@@ -273,11 +343,22 @@ describe('AppointmentsController (e2e)', () => {
     });
 
     it('returns 200 with the cancelled appointment when cancellation succeeds', () => {
-      const confirmed = { id: 'appt-uuid-1', status: 'CONFIRMED' };
+      const confirmed = { id: 'appt-uuid-1', status: 'CONFIRMED', updatedAt: new Date() };
       const cancelled = { ...mockAppointment, status: 'CANCELLED' };
 
       mockPrisma.appointment.findUnique.mockResolvedValue(confirmed);
-      mockPrisma.appointment.update.mockResolvedValue(cancelled);
+      mockPrisma.$transaction.mockImplementation(async (cb: any) => {
+        const txMock = {
+          appointment: {
+            updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+            findUnique: jest.fn().mockResolvedValue(cancelled),
+          },
+          outboxEvent: {
+            create: jest.fn().mockResolvedValue({}),
+          },
+        };
+        return cb(txMock);
+      });
 
       return request(app.getHttpServer())
         .delete('/appointments/appt-uuid-1')

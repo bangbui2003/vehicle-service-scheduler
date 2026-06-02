@@ -221,6 +221,8 @@ prisma/
 
 I treated the AI as a senior developer who executes well but needs architectural direction. My job was to design the system, define constraints, and review everything critically. The AI's job was to accelerate implementation of decisions I had already made.
 
+For example, during the refinement phase, I directed the AI to add key domain constraints (database-backed idempotency using PostgreSQL, dynamic service duration calculation via a `ServiceCatalog`, and timezone-aware UTC operating hours checks) to elevate the production readiness of our solution. To prove that our concurrency controls perform perfectly under pressure, I instructed the AI to write a specific E2E test using `Promise.all()` that fires 5 concurrent booking requests to the same slot, confirming that exactly 1 request succeeds and 4 fail with 409 Conflict. I strictly constrained the implementation to prevent over-engineering: no Redis, no message brokers, and no distributed locks. The entire flow remains atomic, lightweight, and contained within PostgreSQL.
+
 Every significant design decision in this project was reached independently before AI wrote a single line of code. The five most interesting ones are below.
 
 ### Five Architectural Debates

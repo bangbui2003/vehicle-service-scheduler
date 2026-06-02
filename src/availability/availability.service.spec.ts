@@ -1,5 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { AvailabilityService, SERVICE_DURATIONS } from './availability.service';
+import { AvailabilityService } from './availability.service';
 import { PrismaService } from '../prisma/prisma.service';
 
 const mockPrismaService = {
@@ -23,14 +23,14 @@ describe('AvailabilityService', () => {
 
   describe('getServiceDuration', () => {
     it('should return correct duration for known service types', () => {
-      expect(service.getServiceDuration('OIL_CHANGE')).toBe(60);
+      expect(service.getServiceDuration('OIL_CHANGE')).toBe(45);
       expect(service.getServiceDuration('BRAKE_REPAIR')).toBe(120);
       expect(service.getServiceDuration('INSPECTION')).toBe(30);
     });
 
     it('should be case-insensitive', () => {
-      expect(service.getServiceDuration('oil_change')).toBe(60);
-      expect(service.getServiceDuration('Oil_Change')).toBe(60);
+      expect(service.getServiceDuration('oil_change')).toBe(45);
+      expect(service.getServiceDuration('Oil_Change')).toBe(45);
     });
 
     it('should throw for unknown service type', () => {
@@ -43,8 +43,8 @@ describe('AvailabilityService', () => {
   describe('computeEndTime', () => {
     it('should compute correct end time', () => {
       const start = new Date('2026-06-01T09:00:00.000Z');
-      const end = service.computeEndTime(start, 'OIL_CHANGE'); // 60 min
-      expect(end.toISOString()).toBe('2026-06-01T10:00:00.000Z');
+      const end = service.computeEndTime(start, 'OIL_CHANGE'); // 45 min
+      expect(end.toISOString()).toBe('2026-06-01T09:45:00.000Z');
     });
 
     it('should handle 2-hour services', () => {

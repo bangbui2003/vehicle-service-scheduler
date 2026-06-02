@@ -7,5 +7,6 @@ import { AvailabilityModule } from '../availability/availability.module';
   imports: [AvailabilityModule],
   controllers: [SlotsController],
   providers: [SlotsService],
+  exports: [SlotsService],
 })
 export class SlotsModule {}

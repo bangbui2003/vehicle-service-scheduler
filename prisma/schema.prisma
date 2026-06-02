@@ -107,3 +107,30 @@ enum AppointmentStatus {
   COMPLETED
   CANCELLED
 }
+
+model OutboxEvent {
+  id          String       @id @default(uuid())
+  eventType   String       @map("event_type")
+  payload     Json
+  status      OutboxStatus @default(PENDING)
+  createdAt   DateTime     @default(now()) @map("created_at")
+  deliveredAt DateTime?    @map("delivered_at")
+
+  @@index([status, createdAt])
+  @@map("outbox_events")
+}
+
+enum OutboxStatus {
+  PENDING
+  DELIVERED
+  FAILED
+}
+
+model IdempotencyRecord {
+  key          String   @id
+  responseBody String   @map("response_body")
+  statusCode   Int      @map("status_code")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  @@map("idempotency_records")
+}

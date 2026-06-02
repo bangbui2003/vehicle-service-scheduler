@@ -85,7 +85,7 @@ Exposes the core booking endpoints: `POST /appointments` (create), `GET /appoint
 
 ### AppointmentsService
 
-Orchestrates the entire booking transaction. On `create()`, it computes the appointment end time via `AvailabilityService`, opens a Prisma `$transaction`, and calls both availability lookups inside it. If either resource is unavailable, it throws a `ConflictException (409)` and the transaction rolls back. On `cancel()`, it validates the current status before updating to `CANCELLED`.
+Orchestrates the entire booking transaction. On `create()`, it computes the appointment end time via `AvailabilityService`, opens a Prisma `$transaction`, and calls both availability lookups inside it. If either resource is unavailable, it throws a custom `BookingConflictException (409)` containing the next available slot, rolling back the transaction. Inside the same transaction, it writes a domain event to the `outbox_events` table (Transactional Outbox). On `cancel()` and `updateStatus()`, it uses **optimistic locking** via `updateMany + updatedAt` to prevent concurrent modifications from generating duplicate events. `findAll()` supports both **offset pagination** and **cursor-based pagination** (using `(startTime, id)` as the seek key, O(1) at any depth).
 
 ### AvailabilityService
 
@@ -98,6 +98,11 @@ Standard NestJS modules providing `POST`, `GET`, `GET/:id`, `DELETE` for their r
 ### PrismaService
 
 A global singleton that wraps `PrismaClient`. Handles connection lifecycle (`onModuleInit` / `onModuleDestroy`). Exposes `$transaction` for ACID-safe multi-step operations and `$queryRaw` for the locking queries that Prisma's query builder cannot express directly.
+
+### OutboxModule
+
+- **OutboxService**: writes domain events into the `outbox_events` table inside the same Prisma transaction as the business write. Ensures event and appointment are committed or rolled back atomically.
+- **OutboxWorker**: polls `outbox_events` every 500ms using `SELECT ... FOR UPDATE SKIP LOCKED`. Dispatches events to the in-process EventEmitter2. Multiple service instances never double-deliver thanks to the skip-locked pattern. The `dispatch()` method acts as a clean boundary for migrating to a real message broker (RabbitMQ, Kafka, SQS).
 
 ### HealthModule
 
@@ -122,13 +127,36 @@ sequenceDiagram
     participant Avail as AvailabilityService
     participant DB as PostgreSQL
 
-    C->>Ctrl: POST /appointments
+    C->>Ctrl: POST /appointments with X-Idempotency-Key & DTO
     Note over Ctrl: ValidationPipe validates DTO
-    Ctrl->>Svc: create(dto)
-    Svc->>Svc: computeEndTime(serviceType)
-    Note over Svc: OIL_CHANGE adds 60 min to startTime
+    Ctrl->>Svc: create(dto, idempotencyKey)
+    
+    alt Idempotency Key Present (Pre-flight check)
+        Svc->>DB: findUnique IdempotencyRecord by key
+        alt Key Exists
+            DB-->>Svc: Saved Response (responseBody)
+            Svc-->>Ctrl: Saved Response
+            Ctrl-->>C: 201 Created (Saved response)
+        end
+    end
+
+    Svc->>Svc: computeEndTime(startTime, serviceType) via ServiceCatalog lookup
+    Note over Svc: OIL_CHANGE: 45m, TIRE_REPLACEMENT: 90m, etc.
+    
+    Svc->>Svc: validateOperatingHours(startTime, endTime)
+    Note over Svc: Checks 08:00-17:00 UTC, Mon-Sat, same UTC day
 
     Svc->>DB: BEGIN TRANSACTION
+    
+    alt Idempotency Key Present (Double-check inside transaction)
+        Svc->>DB: findUnique IdempotencyRecord by key (P2002 prevention)
+        alt Key Exists
+            DB-->>Svc: Saved Response
+            Svc->>DB: ROLLBACK
+            Svc-->>Ctrl: Saved Response
+            Ctrl-->>C: 201 Created
+        end
+    end
 
     Svc->>Avail: findAvailableBay(tx, dealershipId, start, end)
     Avail->>DB: SELECT ... FOR UPDATE SKIP LOCKED
@@ -138,7 +166,7 @@ sequenceDiagram
     alt No bay available
         Avail-->>Svc: null
         Svc->>DB: ROLLBACK
-        Ctrl-->>C: 409 No service bay available
+        Ctrl-->>C: 409 + nextAvailableSlot
     end
 
     Svc->>Avail: findAvailableTechnician(tx, dealershipId, serviceType, start, end)
@@ -149,17 +177,40 @@ sequenceDiagram
     alt No technician available
         Avail-->>Svc: null
         Svc->>DB: ROLLBACK
-        Ctrl-->>C: 409 No qualified technician available
+        Ctrl-->>C: 409 + nextAvailableSlot
     end
 
     Svc->>DB: INSERT INTO appointments
+    
+    alt Idempotency Key Present
+        Svc->>DB: INSERT INTO idempotency_records (key, responseBody)
+    end
+    
+    Svc->>DB: INSERT INTO outbox_events (same TX)
     DB-->>Svc: Appointment record
-    Svc->>DB: COMMIT - releases row locks
-    Note over Svc: Logs appointment.created event
+    Svc->>DB: COMMIT - releases locks, persists appointment, idempotency key, & outbox event
+    Note over Svc: OutboxWorker delivers event asynchronously
 
     Svc-->>Ctrl: Appointment with relations
     Ctrl-->>C: 201 Created
 ```
+
+### Conflict Response — Enriched 409
+
+When a conflict occurs (i.e., no bay or technician is available), the service calls `SlotsService.findNextAvailable()` and embeds the result in the 409 response:
+
+```json
+{
+  "statusCode": 409,
+  "message": "No service bay available for the requested time slot",
+  "nextAvailableSlot": {
+    "startTime": "2026-07-01T10:00:00.000Z",
+    "endTime": "2026-07-01T11:00:00.000Z"
+  }
+}
+```
+
+This reduces frontend complexity by avoiding an additional slot discovery request.
 
 ### Concurrent Booking - SKIP LOCKED in Action
 
@@ -291,15 +342,11 @@ This section documents deliberate design choices made to ensure the system is re
 
 ### Pagination on `GET /appointments`
 
-**Problem without it:** A dealership with three years of history has hundreds of thousands of appointment records. A single `findMany` with no limit would load all of them into memory, serialize the entire result set to JSON, and either crash the server or time out the client.
+**Problem without it:** A dealership with three years of history has hundreds of thousands of appointment records. A single `findMany` with no limit would load all of them into memory, serialize the entire result set to JSON, and either crash the server or time out the client. Additionally, standard offset pagination (`OFFSET 980`) requires PostgreSQL to scan and discard rows, leading to O(N) degradation at deep page queries.
 
-**Decision:** All list endpoints return a paginated envelope `{ data, total, page, limit }` with a default of 20 records per page and a hard cap of 100.
-
-```json
-{ "data": [...], "total": 4821, "page": 2, "limit": 20 }
-```
-
-The `total` field allows the client to calculate page count without a second request. The hard cap prevents a client passing `limit=999999` and bypassing the guard.
+**Decision:** Implemented two modes of pagination:
+1. **Offset Pagination** (default): returns `{ data, total, page, limit }` allowing random page access for dashboards.
+2. **Cursor Pagination** (`?cursor=<opaque_token>`): performs O(1) index seeks using `(startTime, id)` as the seek key, yielding high performance even at extreme page depths.
 
 ### Database Indexes on the `appointments` Table
 
@@ -336,9 +383,32 @@ if (startTime <= new Date()) {
 
 This is the only pattern that solves the double-booking problem at the database level without introducing an external dependency (Redis, distributed mutex) or a retry loop (optimistic locking).
 
-### Idempotency on create
+### Idempotency via PostgreSQL
 
-`POST /appointments` supports an `X-Idempotency-Key` header. Clients are strongly encouraged to send a stable idempotency key when retrying create operations (for example on network timeouts). The server stores the recent idempotency keys for a short TTL and returns the same result for identical requests bearing the same key.
+**Problem without it:** Under network jitter or client retries (e.g. after HTTP timeouts), identical request payloads can be sent multiple times. If not handled, this creates duplicate bookings (double booking), filling up bays and technicians with phantom appointments.
+
+**Decision:** We implement a lightweight idempotency pattern using PostgreSQL instead of an external cache (like Redis). We introduced the `IdempotencyRecord` table (containing `key`, `responseBody`, `statusCode`, and `createdAt`).
+1. **Pre-transaction check:** When an `X-Idempotency-Key` header is present, we check the `IdempotencyRecord` table first. If a match is found, we immediately parse and return the cached response without running resource checks.
+2. **Atomic persist:** If the key is new, we proceed with booking checks and resource locking. When the appointment is successfully written, the `IdempotencyRecord` is created **inside the same database transaction** alongside the appointment and outbox event.
+3. **P2002 Concurrency Prevention:** Under extreme concurrency where the same idempotency key is submitted simultaneously, the database's unique constraint on `key` will raise a P2002 conflict error. We catch this, perform a final query to load the successfully saved response, and return it safely.
+
+This achieves robust, infrastructure-free idempotency with zero dependency on external caches, maintaining the ACID guarantees of the transactional flow.
+
+### Service Catalog
+
+**Problem without it:** Hardcoding service durations (e.g., assuming every appointment is exactly "60 minutes") restricts flexibility. Different service types (such as `OIL_CHANGE` vs. `TIRE_REPLACEMENT` or `BRAKE_REPAIR`) have different resource usage curves.
+
+**Decision:** We introduced a static dictionary/enum `ServiceCatalog` defining explicit service durations in minutes (e.g., `OIL_CHANGE: 45`, `TIRE_REPLACEMENT: 90`). The calculated `endTime` is calculated dynamically from the `desiredStartTime` and the looked-up duration, enabling a clean way to support variable service lengths.
+
+### Domain-Specific Validations (Operating Hours & Timezone)
+
+**Problem without it:** Booking systems must respect real-world dealership schedules. A user could request a booking at 3 AM or on a Sunday, which would pass the resource checks (since no technicians or bays are occupied at that hour), resulting in a logically invalid appointment.
+
+**Decision:** Added a strict validation step in `AppointmentsService.create()` that enforces the following domain rules:
+1. **UTC Timezone Boundary:** All dates are treated as UTC.
+2. **Operating Hours:** The requested `startTime` and calculated `endTime` must fall between `08:00` and `17:00` UTC.
+3. **Operating Days:** The appointment must be scheduled between Monday and Saturday (dealerships are closed on Sundays).
+4. **Single-Day Span:** An appointment must start and end on the same UTC day (no multi-day or overnight appointments).
 
 ### Rate limiting
 
@@ -349,6 +419,18 @@ The application enforces rate limiting using `@nestjs/throttler`. In production 
 **Problem without it:** `const where: any = {}` compiles successfully even if a field name is misspelled or a Prisma schema field is renamed during refactoring. The bug only surfaces at runtime.
 
 **Decision:** `Prisma.AppointmentWhereInput` is used instead of `any`. TypeScript catches mismatched field names at compile time, meaning a schema rename triggers a compiler error on every query that references the old field name.
+
+### Transactional Outbox Pattern
+
+**Problem without it:** Emitting domain events directly after a database commit is vulnerable to crashes. If the process dies between the database commit and the event emission, the system enters an inconsistent state (the booking exists but downstream consumers like notifications are never notified).
+
+**Decision:** Persist events into the `outbox_events` table inside the same transaction as the booking write. A background worker polls the table using `SELECT FOR UPDATE SKIP LOCKED` and dispatches the events, guaranteeing at-least-once delivery with crash safety.
+
+### Optimistic Locking on cancellations and status updates
+
+**Problem without it:** Under concurrent status update or cancellation requests, a classical read-then-write sequence might suffer from TOCTOU (Time-of-Check, Time-of-Use) issues. Multiple requests could pass status validation guards concurrently, execute updates twice, and emit duplicate events.
+
+**Decision:** We use Prisma's `updateMany` filtering on `id` and the `updatedAt` version token. If `count === 0`, it signifies another request modified the appointment in the meantime, and we throw a ConflictException, preventing duplicate event delivery.
 
 ---
 

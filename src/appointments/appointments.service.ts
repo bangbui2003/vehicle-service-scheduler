@@ -5,18 +5,16 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { EventEmitter2 } from '@nestjs/event-emitter';
 import { Appointment, AppointmentStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AvailabilityService } from '../availability/availability.service';
 import { MetricsService } from '../metrics/metrics.service';
+import { OutboxService } from '../outbox/outbox.service';
+import { SlotsService, NextAvailableSlot } from '../slots/slots.service';
+import { BookingConflictException } from '../common/exceptions/booking-conflict.exception';
+import { encodeCursor, decodeCursor } from '../common/pagination/cursor.util';
 import { CreateAppointmentDto } from './dto/create-appointment.dto';
 import { UpdateAppointmentStatusDto } from './dto/update-appointment-status.dto';
-import {
-  AppointmentCreatedEvent,
-  AppointmentCancelledEvent,
-  AppointmentStatusChangedEvent,
-} from '../events/appointment.events';
 
 const ALLOWED_TRANSITIONS: Record<AppointmentStatus, AppointmentStatus[]> = {
   [AppointmentStatus.CONFIRMED]:   [AppointmentStatus.IN_PROGRESS, AppointmentStatus.CANCELLED],
@@ -24,6 +22,15 @@ const ALLOWED_TRANSITIONS: Record<AppointmentStatus, AppointmentStatus[]> = {
   [AppointmentStatus.COMPLETED]:   [],
   [AppointmentStatus.CANCELLED]:   [],
 };
+
+export interface PaginatedAppointments {
+  data: Appointment[];
+  total?: number;
+  page?: number;
+  limit: number;
+  nextCursor?: string | null;
+  hasMore?: boolean;
+}
 
 @Injectable()
 export class AppointmentsService {
@@ -33,18 +40,55 @@ export class AppointmentsService {
     private readonly prisma: PrismaService,
     private readonly availabilityService: AvailabilityService,
     private readonly metrics: MetricsService,
-    private readonly eventEmitter: EventEmitter2,
+    private readonly outbox: OutboxService,
+    private readonly slotsService: SlotsService,
   ) {}
+
+  private validateOperatingHours(start: Date, end: Date): void {
+    // Must be on the same UTC day
+    const startYear = start.getUTCFullYear();
+    const startMonth = start.getUTCMonth();
+    const startDate = start.getUTCDate();
+
+    const endYear = end.getUTCFullYear();
+    const endMonth = end.getUTCMonth();
+    const endDate = end.getUTCDate();
+
+    if (startYear !== endYear || startMonth !== endMonth || startDate !== endDate) {
+      throw new BadRequestException('Appointments must start and end on the same day');
+    }
+
+    const startDay = start.getUTCDay();
+    const endDay = end.getUTCDay();
+
+    // Sunday = 0
+    if (startDay === 0 || endDay === 0) {
+      throw new BadRequestException('Dealership is closed on Sundays');
+    }
+
+    // Operating hours: 08:00 to 17:00 UTC
+    const startMinutes = start.getUTCHours() * 60 + start.getUTCMinutes();
+    const endMinutes = end.getUTCHours() * 60 + end.getUTCMinutes();
+
+    const openMinutes = 8 * 60;   // 08:00
+    const closeMinutes = 17 * 60; // 17:00
+
+    if (startMinutes < openMinutes || startMinutes > closeMinutes) {
+      throw new BadRequestException('Appointment start time must be within operating hours (08:00 - 17:00 UTC)');
+    }
+    if (endMinutes < openMinutes || endMinutes > closeMinutes) {
+      throw new BadRequestException('Appointment end time must be within operating hours (08:00 - 17:00 UTC)');
+    }
+  }
 
   async create(dto: CreateAppointmentDto, idempotencyKey?: string): Promise<Appointment> {
     if (idempotencyKey) {
-      const existing = await this.prisma.appointment.findUnique({
-        where: { idempotencyKey },
-        include: { customer: true, vehicle: true, technician: true, serviceBay: true },
+      const existing = await this.prisma.idempotencyRecord.findUnique({
+        where: { key: idempotencyKey },
       });
       if (existing) {
-        this.logger.log({ msg: 'appointment.idempotent_hit', idempotencyKey, appointmentId: existing.id });
-        return existing;
+        this.logger.log({ msg: 'appointment.idempotent_hit', idempotencyKey });
+        return JSON.parse(existing.responseBody);
       }
     }
 
@@ -59,6 +103,8 @@ export class AppointmentsService {
       dto.serviceType,
     );
 
+    this.validateOperatingHours(startTime, endTime);
+
     this.logger.log({
       msg: 'Attempting to create appointment',
       dealershipId: dto.dealershipId,
@@ -67,85 +113,136 @@ export class AppointmentsService {
       endTime,
     });
 
-    const appointment = await this.prisma.$transaction(async (tx) => {
-      // 1. Find available service bay
-      const bay = await this.availabilityService.findAvailableBay(
-        tx as any,
-        dto.dealershipId,
-        startTime,
-        endTime,
-      );
+    try {
+      const appointment = await this.prisma.$transaction(async (tx) => {
+        if (idempotencyKey) {
+          const existing = await tx.idempotencyRecord.findUnique({
+            where: { key: idempotencyKey },
+          });
+          if (existing) {
+            return JSON.parse(existing.responseBody);
+          }
+        }
 
-      if (!bay) {
-        this.logger.warn({
-          msg: 'No available service bay',
-          dealershipId: dto.dealershipId,
+        // 1. Find available service bay
+        const bay = await this.availabilityService.findAvailableBay(
+          tx as any,
+          dto.dealershipId,
           startTime,
           endTime,
-        });
-        this.metrics.appointmentBookings.inc({ outcome: 'conflict_bay' });
-        throw new ConflictException(
-          'No service bay available for the requested time slot',
         );
-      }
 
-      // 2. Find available technician
-      const technician = await this.availabilityService.findAvailableTechnician(
-        tx as any,
-        dto.dealershipId,
-        dto.serviceType,
-        startTime,
-        endTime,
-      );
+        if (!bay) {
+          this.logger.warn({
+            msg: 'No available service bay',
+            dealershipId: dto.dealershipId,
+            startTime,
+            endTime,
+          });
+          this.metrics.appointmentBookings.inc({ outcome: 'conflict_bay' });
+          throw new ConflictException(
+            'No service bay available for the requested time slot',
+          );
+        }
 
-      if (!technician) {
-        this.logger.warn({
-          msg: 'No available technician',
-          dealershipId: dto.dealershipId,
-          serviceType: dto.serviceType,
+        // 2. Find available technician
+        const technician = await this.availabilityService.findAvailableTechnician(
+          tx as any,
+          dto.dealershipId,
+          dto.serviceType,
           startTime,
           endTime,
-        });
-        this.metrics.appointmentBookings.inc({ outcome: 'conflict_tech' });
-        throw new ConflictException(
-          `No qualified technician available for ${dto.serviceType} at the requested time`,
         );
-      }
 
-      // 3. Create the appointment record
-      return tx.appointment.create({
-        data: {
-          customerId: dto.customerId,
-          vehicleId: dto.vehicleId,
-          dealershipId: dto.dealershipId,
-          technicianId: technician.id,
-          serviceBayId: bay.id,
-          serviceType: dto.serviceType.toUpperCase(),
-          startTime,
-          endTime,
-          status: AppointmentStatus.CONFIRMED,
-          notes: dto.notes,
-          idempotencyKey: idempotencyKey ?? null,
-        },
-        include: {
-          customer: true,
-          vehicle: true,
-          technician: true,
-          serviceBay: true,
-        },
+        if (!technician) {
+          this.logger.warn({
+            msg: 'No available technician',
+            dealershipId: dto.dealershipId,
+            serviceType: dto.serviceType,
+            startTime,
+            endTime,
+          });
+          this.metrics.appointmentBookings.inc({ outcome: 'conflict_tech' });
+          throw new ConflictException(
+            `No qualified technician available for ${dto.serviceType} at the requested time`,
+          );
+        }
+
+        // 3. Create the appointment record
+        const appt = await tx.appointment.create({
+          data: {
+            customerId: dto.customerId,
+            vehicleId: dto.vehicleId,
+            dealershipId: dto.dealershipId,
+            technicianId: technician.id,
+            serviceBayId: bay.id,
+            serviceType: dto.serviceType.toUpperCase(),
+            startTime,
+            endTime,
+            status: AppointmentStatus.CONFIRMED,
+            notes: dto.notes,
+            idempotencyKey: idempotencyKey ?? null,
+          },
+          include: {
+            customer: true,
+            vehicle: true,
+            technician: true,
+            serviceBay: true,
+          },
+        });
+
+        // 4. Save response to IdempotencyRecord table inside the same transaction
+        if (idempotencyKey) {
+          await tx.idempotencyRecord.create({
+            data: {
+              key: idempotencyKey,
+              responseBody: JSON.stringify(appt),
+              statusCode: 201,
+            },
+          });
+        }
+
+        // 5. Write event to outbox inside the same transaction
+        await this.outbox.publish(tx, 'appointment.created', { appointment: appt });
+
+        return appt;
       });
-    });
 
-    this.metrics.appointmentBookings.inc({ outcome: 'created' });
-    this.logger.log({
-      msg: 'appointment.created',
-      appointmentId: appointment.id,
-      technicianId: appointment.technicianId,
-      serviceBayId: appointment.serviceBayId,
-    });
-    this.eventEmitter.emit('appointment.created', new AppointmentCreatedEvent(appointment));
+      this.metrics.appointmentBookings.inc({ outcome: 'created' });
+      this.logger.log({
+        msg: 'appointment.created',
+        appointmentId: appointment.id,
+        technicianId: appointment.technicianId,
+        serviceBayId: appointment.serviceBayId,
+      });
 
-    return appointment;
+      return appointment;
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        if (idempotencyKey) {
+          const existing = await this.prisma.idempotencyRecord.findUnique({
+            where: { key: idempotencyKey },
+          });
+          if (existing) {
+            this.logger.log({ msg: 'appointment.idempotent_hit_concurrency', idempotencyKey });
+            return JSON.parse(existing.responseBody);
+          }
+        }
+      }
+      // Catch ConflictException and enrich it with the next available slot
+      if (error instanceof ConflictException) {
+        const nextAvailableSlot = await this.slotsService.findNextAvailable(
+          dto.dealershipId,
+          dto.serviceType,
+          startTime,
+        );
+        throw new BookingConflictException(
+          error.message,
+          nextAvailableSlot || undefined,
+        );
+      }
+      throw error;
+    }
   }
 
   async updateStatus(id: string, dto: UpdateAppointmentStatusDto): Promise<Appointment> {
@@ -164,18 +261,47 @@ export class AppointmentsService {
       );
     }
 
-    const updated = await this.prisma.appointment.update({
-      where: { id },
-      data: { status: dto.status },
-      include: { customer: true, vehicle: true, technician: true, serviceBay: true },
+    const updated = await this.prisma.$transaction(async (tx) => {
+      const result = await tx.appointment.updateMany({
+        where: {
+          id,
+          updatedAt: appointment.updatedAt,
+        },
+        data: {
+          status: dto.status,
+        },
+      });
+
+      if (result.count === 0) {
+        throw new ConflictException(
+          'Appointment was modified by another request. Please reload and retry.',
+        );
+      }
+
+      const appt = await tx.appointment.findUnique({
+        where: { id },
+        include: {
+          customer: true,
+          vehicle: true,
+          technician: true,
+          serviceBay: true,
+        },
+      });
+
+      if (!appt) {
+        throw new NotFoundException(`Appointment ${id} not found`);
+      }
+
+      await this.outbox.publish(tx, 'appointment.status_changed', {
+        appointment: appt,
+        previousStatus: appointment.status,
+      });
+
+      return appt;
     });
 
     this.logger.log({ msg: 'appointment.status_changed', appointmentId: id, from: appointment.status, to: dto.status });
-    this.eventEmitter.emit(
-      'appointment.status_changed',
-      new AppointmentStatusChangedEvent(updated, appointment.status),
-    );
-
+    
     return updated;
   }
 
@@ -203,11 +329,9 @@ export class AppointmentsService {
     date?: string;
     page?: number;
     limit?: number;
-  }): Promise<{ data: Appointment[]; total: number; page: number; limit: number }> {
-    const page = Math.max(1, filters.page ?? 1);
+    cursor?: string;
+  }): Promise<PaginatedAppointments> {
     const limit = Math.min(100, Math.max(1, filters.limit ?? 20));
-    const skip = (page - 1) * limit;
-
     const where: Prisma.AppointmentWhereInput = {};
 
     if (filters.customerId) where.customerId = filters.customerId;
@@ -219,18 +343,76 @@ export class AppointmentsService {
       where.startTime = { gte: day, lt: nextDay };
     }
 
-    const [data, total] = await Promise.all([
-      this.prisma.appointment.findMany({
+    // Cursor-based pagination branch
+    if (filters.cursor) {
+      const decoded = decodeCursor(filters.cursor);
+      if (decoded) {
+        const cursorTime = new Date(decoded.startTime);
+        where.OR = [
+          {
+            startTime: { gt: cursorTime },
+          },
+          {
+            startTime: cursorTime,
+            id: { gt: decoded.id },
+          },
+        ];
+      }
+    }
+
+    if (filters.cursor) {
+      // Fetch limit + 1 items to see if hasMore is true
+      const data = await this.prisma.appointment.findMany({
         where,
         include: { customer: true, vehicle: true, technician: true, serviceBay: true },
-        orderBy: { startTime: 'asc' },
-        skip,
-        take: limit,
-      }),
-      this.prisma.appointment.count({ where }),
-    ]);
+        orderBy: [
+          { startTime: 'asc' },
+          { id: 'asc' },
+        ],
+        take: limit + 1,
+      });
 
-    return { data, total, page, limit };
+      const hasMore = data.length > limit;
+      const resultData = hasMore ? data.slice(0, limit) : data;
+      
+      let nextCursor: string | null = null;
+      if (hasMore && resultData.length > 0) {
+        const lastItem = resultData[resultData.length - 1];
+        nextCursor = encodeCursor({
+          id: lastItem.id,
+          startTime: lastItem.startTime.toISOString(),
+        });
+      }
+
+      return {
+        data: resultData,
+        limit,
+        nextCursor,
+        hasMore,
+      };
+    } else {
+      // Offset pagination branch
+      const page = Math.max(1, filters.page ?? 1);
+      const skip = (page - 1) * limit;
+
+      const [data, total] = await Promise.all([
+        this.prisma.appointment.findMany({
+          where,
+          include: { customer: true, vehicle: true, technician: true, serviceBay: true },
+          orderBy: { startTime: 'asc' },
+          skip,
+          take: limit,
+        }),
+        this.prisma.appointment.count({ where }),
+      ]);
+
+      return {
+        data,
+        total,
+        page,
+        limit,
+      };
+    }
   }
 
   async cancel(id: string): Promise<Appointment> {
@@ -244,20 +426,44 @@ export class AppointmentsService {
       throw new ConflictException('Cannot cancel a completed appointment');
     }
 
-    const updated = await this.prisma.appointment.update({
-      where: { id },
-      data: { status: AppointmentStatus.CANCELLED },
-      include: {
-        customer: true,
-        vehicle: true,
-        technician: true,
-        serviceBay: true,
-      },
+    const updated = await this.prisma.$transaction(async (tx) => {
+      const result = await tx.appointment.updateMany({
+        where: {
+          id,
+          updatedAt: appointment.updatedAt,
+        },
+        data: {
+          status: AppointmentStatus.CANCELLED,
+        },
+      });
+
+      if (result.count === 0) {
+        throw new ConflictException(
+          'Appointment was modified by another request. Please reload and retry.',
+        );
+      }
+
+      const appt = await tx.appointment.findUnique({
+        where: { id },
+        include: {
+          customer: true,
+          vehicle: true,
+          technician: true,
+          serviceBay: true,
+        },
+      });
+
+      if (!appt) {
+        throw new NotFoundException(`Appointment ${id} not found`);
+      }
+
+      await this.outbox.publish(tx, 'appointment.cancelled', { appointment: appt });
+
+      return appt;
     });
 
     this.metrics.appointmentBookings.inc({ outcome: 'cancelled' });
     this.logger.log({ msg: 'appointment.cancelled', appointmentId: id });
-    this.eventEmitter.emit('appointment.cancelled', new AppointmentCancelledEvent(updated));
 
     return updated;
   }

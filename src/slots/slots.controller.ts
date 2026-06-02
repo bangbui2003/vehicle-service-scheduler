@@ -3,7 +3,7 @@ import { ApiOperation, ApiQuery, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { SkipThrottle } from '@nestjs/throttler';
 import { IsDateString, IsNotEmpty, IsString, validateSync } from 'class-validator';
 import { plainToInstance } from 'class-transformer';
-import { SERVICE_DURATIONS } from '../availability/availability.service';
+import { ServiceCatalog } from '../appointments/constants/service-catalog';
 import { SlotsService } from './slots.service';
 
 class NextAvailableQuery {
@@ -24,7 +24,7 @@ export class SlotsController {
     description: 'Returns the earliest window where both a ServiceBay and a qualified Technician are free. Searches up to 7 days ahead. Uses 3 DB queries regardless of search horizon.',
   })
   @ApiQuery({ name: 'dealershipId', required: true })
-  @ApiQuery({ name: 'serviceType', required: true, enum: Object.keys(SERVICE_DURATIONS) })
+  @ApiQuery({ name: 'serviceType', required: true, enum: Object.keys(ServiceCatalog) })
   @ApiQuery({ name: 'from', required: true, example: '2026-07-01T09:00:00.000Z', description: 'Search start time (ISO 8601)' })
   @ApiResponse({ status: 200, description: 'Next available slot found or null if none in 7 days' })
   async findNextAvailable(
@@ -36,8 +36,8 @@ export class SlotsController {
     const errors = validateSync(query);
     if (errors.length > 0) throw new BadRequestException(errors.map((e) => Object.values(e.constraints ?? {})).flat());
 
-    if (!SERVICE_DURATIONS[serviceType.toUpperCase()]) {
-      throw new BadRequestException(`Unknown service type: ${serviceType}. Valid: ${Object.keys(SERVICE_DURATIONS).join(', ')}`);
+    if (!ServiceCatalog[serviceType.toUpperCase()]) {
+      throw new BadRequestException(`Unknown service type: ${serviceType}. Valid: ${Object.keys(ServiceCatalog).join(', ')}`);
     }
 
     const result = await this.slotsService.findNextAvailable(dealershipId, serviceType, new Date(from));

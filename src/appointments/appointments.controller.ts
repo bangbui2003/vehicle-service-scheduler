@@ -29,7 +29,25 @@ export class AppointmentsController {
   @ApiOperation({ summary: 'Create a new appointment' })
   @ApiHeader({ name: 'X-Idempotency-Key', required: false, description: 'Optional UUID to prevent duplicate bookings on retry' })
   @ApiResponse({ status: 201, description: 'Appointment created successfully' })
-  @ApiResponse({ status: 409, description: 'No available bay or technician' })
+  @ApiResponse({
+    status: 409,
+    description: 'No available bay or technician. Returns next available slot if one exists.',
+    schema: {
+      type: 'object',
+      properties: {
+        statusCode: { type: 'number', example: 409 },
+        message: { type: 'string', example: 'No service bay available for the requested time slot' },
+        nextAvailableSlot: {
+          type: 'object',
+          nullable: true,
+          properties: {
+            startTime: { type: 'string', format: 'date-time', example: '2026-06-02T09:00:00.000Z' },
+            endTime: { type: 'string', format: 'date-time', example: '2026-06-02T10:00:00.000Z' },
+          },
+        },
+      },
+    },
+  })
   @ApiResponse({ status: 400, description: 'Invalid request body' })
   @ApiResponse({ status: 429, description: 'Too many requests' })
   create(
@@ -41,20 +59,22 @@ export class AppointmentsController {
 
   @Get()
   @SkipThrottle()
-  @ApiOperation({ summary: 'List appointments with optional filters and pagination' })
+  @ApiOperation({ summary: 'List appointments with optional filters and pagination (offset or cursor)' })
   @ApiQuery({ name: 'customerId', required: false })
   @ApiQuery({ name: 'dealershipId', required: false })
   @ApiQuery({ name: 'date', required: false, example: '2026-06-01' })
-  @ApiQuery({ name: 'page', required: false, example: 1 })
+  @ApiQuery({ name: 'page', required: false, example: 1, description: 'Offset page number. Ignored if cursor is passed.' })
   @ApiQuery({ name: 'limit', required: false, example: 20, description: 'Max 100' })
+  @ApiQuery({ name: 'cursor', required: false, description: 'Opaque base64url cursor for index seek O(1) pagination' })
   findAll(
     @Query('customerId') customerId?: string,
     @Query('dealershipId') dealershipId?: string,
     @Query('date') date?: string,
     @Query('page', new DefaultValuePipe(1), ParseIntPipe) page?: number,
     @Query('limit', new DefaultValuePipe(20), ParseIntPipe) limit?: number,
+    @Query('cursor') cursor?: string,
   ) {
-    return this.appointmentsService.findAll({ customerId, dealershipId, date, page, limit });
+    return this.appointmentsService.findAll({ customerId, dealershipId, date, page, limit, cursor });
   }
 
   @Get(':id')
@@ -70,7 +90,7 @@ export class AppointmentsController {
   @ApiOperation({ summary: 'Update appointment status (state machine)' })
   @ApiResponse({ status: 200, description: 'Status updated' })
   @ApiResponse({ status: 400, description: 'Cannot set IN_PROGRESS before start time' })
-  @ApiResponse({ status: 409, description: 'Invalid state transition' })
+  @ApiResponse({ status: 409, description: 'Invalid state transition or concurrent modification conflict' })
   updateStatus(@Param('id') id: string, @Body() dto: UpdateAppointmentStatusDto) {
     return this.appointmentsService.updateStatus(id, dto);
   }
@@ -79,7 +99,7 @@ export class AppointmentsController {
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Cancel an appointment' })
   @ApiResponse({ status: 200, description: 'Appointment cancelled' })
-  @ApiResponse({ status: 409, description: 'Cannot cancel this appointment' })
+  @ApiResponse({ status: 409, description: 'Cannot cancel this appointment or concurrent modification conflict' })
   cancel(@Param('id') id: string) {
     return this.appointmentsService.cancel(id);
   }

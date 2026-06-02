@@ -13,6 +13,7 @@ import { VehiclesModule } from './vehicles/vehicles.module';
 import { HealthModule } from './health/health.module';
 import { MetricsModule } from './metrics/metrics.module';
 import { SlotsModule } from './slots/slots.module';
+import { OutboxModule } from './outbox/outbox.module';
 import { AppointmentEventsListener } from './events/appointment-events.listener';
 
 @Module({
@@ -43,6 +44,7 @@ import { AppointmentEventsListener } from './events/appointment-events.listener'
     HealthModule,
     MetricsModule,
     SlotsModule,
+    OutboxModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: ThrottlerGuard },
