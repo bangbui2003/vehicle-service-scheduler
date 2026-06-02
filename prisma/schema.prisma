@@ -17,23 +17,23 @@ model Customer {
   phone        String?
   vehicles     Vehicle[]
   appointments Appointment[]
-  createdAt    DateTime      @default(now())
-  updatedAt    DateTime      @updatedAt
+  createdAt    DateTime      @default(now()) @map("created_at")
+  updatedAt    DateTime      @updatedAt @map("updated_at")
 
   @@map("customers")
 }
 
 model Vehicle {
   id           String        @id @default(uuid())
-  customerId   String
+  customerId   String        @map("customer_id")
   customer     Customer      @relation(fields: [customerId], references: [id])
   make         String
   model        String
   year         Int
-  licensePlate String        @unique
+  licensePlate String        @unique @map("license_plate")
   appointments Appointment[]
-  createdAt    DateTime      @default(now())
-  updatedAt    DateTime      @updatedAt
+  createdAt    DateTime      @default(now()) @map("created_at")
+  updatedAt    DateTime      @updatedAt @map("updated_at")
 
   @@map("vehicles")
 }
@@ -44,55 +44,55 @@ model Dealership {
   address     String?
   serviceBays ServiceBay[]
   technicians Technician[]
-  createdAt   DateTime     @default(now())
+  createdAt   DateTime     @default(now()) @map("created_at")
 
   @@map("dealerships")
 }
 
 model ServiceBay {
   id           String        @id @default(uuid())
-  dealershipId String
+  dealershipId String        @map("dealership_id")
   dealership   Dealership    @relation(fields: [dealershipId], references: [id])
   name         String
   appointments Appointment[]
-  createdAt    DateTime      @default(now())
+  createdAt    DateTime      @default(now()) @map("created_at")
 
   @@map("service_bays")
 }
 
 model Technician {
   id              String        @id @default(uuid())
-  dealershipId    String
+  dealershipId    String        @map("dealership_id")
   dealership      Dealership    @relation(fields: [dealershipId], references: [id])
   name            String
   email           String        @unique
   specializations String[]
   appointments    Appointment[]
-  createdAt       DateTime      @default(now())
-  updatedAt       DateTime      @updatedAt
+  createdAt       DateTime      @default(now()) @map("created_at")
+  updatedAt       DateTime      @updatedAt @map("updated_at")
 
   @@map("technicians")
 }
 
 model Appointment {
   id           String            @id @default(uuid())
-  customerId   String
+  customerId   String            @map("customer_id")
   customer     Customer          @relation(fields: [customerId], references: [id])
-  vehicleId    String
+  vehicleId    String            @map("vehicle_id")
   vehicle      Vehicle           @relation(fields: [vehicleId], references: [id])
-  technicianId String
+  technicianId String            @map("technician_id")
   technician   Technician        @relation(fields: [technicianId], references: [id])
-  serviceBayId String
+  serviceBayId String            @map("service_bay_id")
   serviceBay   ServiceBay        @relation(fields: [serviceBayId], references: [id])
-  dealershipId String
-  serviceType  String
-  startTime    DateTime
-  endTime      DateTime
+  dealershipId String            @map("dealership_id")
+  serviceType  String            @map("service_type")
+  startTime    DateTime          @map("start_time")
+  endTime      DateTime          @map("end_time")
   status       AppointmentStatus @default(CONFIRMED)
   notes          String?
-  idempotencyKey String?           @unique
-  createdAt      DateTime          @default(now())
-  updatedAt    DateTime          @updatedAt
+  idempotencyKey String?           @unique @map("idempotency_key")
+  createdAt      DateTime          @default(now()) @map("created_at")
+  updatedAt    DateTime          @updatedAt @map("updated_at")
 
   @@index([dealershipId, startTime])
   @@index([serviceBayId, startTime, endTime])

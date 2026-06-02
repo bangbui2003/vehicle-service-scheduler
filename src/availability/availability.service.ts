@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { ServiceBay, Technician } from '@prisma/client';
 import { ServiceCatalog } from '../appointments/constants/service-catalog';
@@ -10,7 +10,7 @@ export class AvailabilityService {
   getServiceDuration(serviceType: string): number {
     const duration = ServiceCatalog[serviceType.toUpperCase()];
     if (!duration) {
-      throw new Error(`Unknown service type: ${serviceType}`);
+      throw new BadRequestException(`Unknown service type: ${serviceType}`);
     }
     return duration;
   }

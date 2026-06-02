@@ -27,7 +27,6 @@ export class AppointmentsController {
   @Post()
   @Throttle({ default: { ttl: 60_000, limit: 10 } })
   @ApiOperation({ summary: 'Create a new appointment' })
-  @ApiHeader({ name: 'X-Idempotency-Key', required: false, description: 'Optional UUID to prevent duplicate bookings on retry' })
   @ApiResponse({ status: 201, description: 'Appointment created successfully' })
   @ApiResponse({
     status: 409,

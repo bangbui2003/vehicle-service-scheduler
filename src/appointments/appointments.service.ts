@@ -399,18 +399,32 @@ export class AppointmentsService {
         this.prisma.appointment.findMany({
           where,
           include: { customer: true, vehicle: true, technician: true, serviceBay: true },
-          orderBy: { startTime: 'asc' },
+          orderBy: [
+            { startTime: 'asc' },
+            { id: 'asc' },
+          ],
           skip,
           take: limit,
         }),
         this.prisma.appointment.count({ where }),
       ]);
 
+      const hasMore = total > skip + data.length;
+      let nextCursor: string | null = null;
+      if (hasMore && data.length > 0) {
+        const lastItem = data[data.length - 1];
+        nextCursor = encodeCursor({
+          id: lastItem.id,
+          startTime: lastItem.startTime.toISOString(),
+        });
+      }
+
       return {
         data,
         total,
         page,
         limit,
+        nextCursor,
       };
     }
   }
